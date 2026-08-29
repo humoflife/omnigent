@@ -266,6 +266,20 @@ nimble = ["nimble-python>=1.2.0,<2"]
 slack = [
     "omnigent-slack==0.12.0.dev0",
 ]
+# Discord integration (`omni integration discord`). The @omnigent gateway bot
+# lives in the separate `omnigent-discord` package (heavy deps — discord.py /
+# aiohttp — kept out of the baseline install), a sibling of `omnigent-slack`
+# rather than a layer on it: both are standalone bots that never import
+# `omnigent` core. The CLI launches it as a subprocess (`python -m
+# omnigent_discord`), so it must be importable in the same environment;
+# installing `omnigent[discord]` puts it there. Local/editable installs resolve
+# it from `integrations/discord` via [tool.uv.sources] below. Version-locked
+# (==) with the lockstep cycle — `scripts/update_versions.py` keeps this pin in
+# sync with the other sibling `==` pins and the sub-package's own
+# `[project].version` in `integrations/discord/pyproject.toml`.
+discord = [
+    "omnigent-discord==0.12.0.dev0",
+]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -415,6 +429,10 @@ omnigent-ui-sdk = { path = "sdks/ui", editable = true }
 # Local resolution for the `slack` extra. Only pulled in when `omnigent[slack]`
 # is requested (the extra is opt-in), so a default install never builds it.
 omnigent-slack = { path = "integrations/slack", editable = true }
+# Local resolution for the `discord` extra. Only pulled in when
+# `omnigent[discord]` is requested (the extra is opt-in), so a default install
+# never builds it.
+omnigent-discord = { path = "integrations/discord", editable = true }
 
 [tool.setuptools]
 include-package-data = true
@@ -646,6 +664,12 @@ known-first-party = ["omnigent"]
 # catches (best-effort acks, background login tasks) that must never abort a
 # turn, hence BLE001.
 "integrations/slack/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+# discord.py dispatches component callbacks with a fixed signature and the bot
+# has deliberate boundary catches (best-effort edits, private notices,
+# background login tasks) that must never abort a turn, hence BLE001.
+"integrations/discord/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
 # The sessions route is a facade over an implementation package. Its explicit

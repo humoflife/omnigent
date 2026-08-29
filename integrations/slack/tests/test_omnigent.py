@@ -1325,3 +1325,40 @@ async def test_run_turn_survives_many_drops_that_each_make_progress(
     # Every leg's new delta was forwarded and the turn completed — not abandoned
     # despite far more drops than the consecutive-reconnect cap.
     assert "".join(d for d in deltas if d) == "".join(f"part{i} " for i in range(n_legs))
+
+
+@respx.mock
+async def test_harness_that_never_starts_ends_turn_immediately() -> None:
+    """A harness that cannot launch must end the turn, not wait out the grace.
+
+    A harness that fails to start (no tmux, missing binary) reports the failure
+    with NO ``running`` edge and no delta, so the id-less ``failed`` that
+    follows must not be dismissed as a status replayed from before the turn.
+    Getting this wrong strands the user on an unchanging placeholder until the
+    idle grace expires, minutes after the server already said the turn was
+    dead. Observed live on the Discord sibling against claude-native without
+    tmux; this client runs the identical loop.
+    """
+    body = (
+        'data: {"type":"session.input.consumed"}\n\n'
+        'data: {"type":"response.error","error":{"message":'
+        '"Native Claude terminal failed to start"}}\n\n'
+        'data: {"type":"session.status","status":"failed"}\n\n'
+        'data: {"type":"session.heartbeat"}\n\n'  # must never be reached
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(202, json={})
+    )
+    respx.get("http://omnigent.test/health").mock(return_value=httpx.Response(200))
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, text=body)
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        events = [e async for e in client.run_turn("conv_1", "hi", idle_grace_seconds=1)]
+    finally:
+        await client.aclose()
+
+    types = [e.get("type") for e in events]
+    assert types[-1] == "session.status"
+    assert "session.heartbeat" not in types

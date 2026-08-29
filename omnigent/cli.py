@@ -10073,14 +10073,13 @@ class _ConfigGroup(click.Group):
         return super().parse_args(ctx, args)
 
 
-# ── Integrations (Slack, …) ───────────────────────────────────────────
+# ── Integrations (Slack, Discord, …) ──────────────────────────────────
 
-# Each chat bot lives in its own package with heavy deps (slack_bolt, aiohttp)
-# kept out of the core CLI install. The CLI launches one as a subprocess and
-# never imports it, so an integration differs from the next only in the
+# Each chat bot lives in its own package with heavy deps (slack_bolt /
+# discord.py, aiohttp) kept out of the core CLI install. The CLI launches one as
+# a subprocess and never imports it, so the two integrations differ only in the
 # metadata below — the command group, the daemon manager, and every subcommand
-# are generated from it, which is what keeps a second bot from drifting away
-# from the first in how it starts, stops, and reports.
+# are generated from it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -10136,6 +10135,11 @@ def _slack_installed() -> bool:
     return _module_installed("omnigent_slack")
 
 
+def _discord_installed() -> bool:
+    """Whether the ``omnigent_discord`` package is importable (not imported)."""
+    return _module_installed("omnigent_discord")
+
+
 # The lambdas defer the lookup to call time so ``mock.patch`` on the module
 # attribute takes effect in tests.
 _SLACK = _Integration(
@@ -10146,7 +10150,15 @@ _SLACK = _Integration(
     extra="slack",
     installed=lambda: _slack_installed(),
 )
-_INTEGRATIONS = (_SLACK,)
+_DISCORD = _Integration(
+    name="discord",
+    label="Discord",
+    package="omnigent_discord",
+    dist="omnigent-discord",
+    extra="discord",
+    installed=lambda: _discord_installed(),
+)
+_INTEGRATIONS = (_SLACK, _DISCORD)
 
 
 def _integration_state_dir() -> Path:
@@ -10163,10 +10175,11 @@ def integration(ctx: click.Context) -> None:
 
     \b
     Available integrations:
-      slack   The @omnigent Slack socket-mode bot.
+      slack     The @omnigent Slack socket-mode bot.
+      discord   The @omnigent Discord gateway bot.
 
-    Run ``omni integration slack`` to start the bot in the foreground, or add
-    ``--background`` to run it as a detached daemon.
+    Run ``omni integration slack`` (or ``discord``) to start a bot in the
+    foreground, or add ``--background`` to run it as a detached daemon.
     """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
