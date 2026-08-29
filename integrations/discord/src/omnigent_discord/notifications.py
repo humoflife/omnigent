@@ -18,7 +18,8 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
-from omnigent_discord.events import OutputFile
+from omnigent_bot_core.events import OutputFile
+
 from omnigent_discord.models import ChannelKey
 from omnigent_discord.text import (
     GENERIC_FAILURE_TEXT,

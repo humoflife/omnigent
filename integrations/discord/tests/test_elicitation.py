@@ -13,17 +13,17 @@ import logging
 
 import pytest
 from fakes import FakeOmnigent, RecordingChannel
+from omnigent_bot_core.events import (
+    ElicitationOption,
+    ElicitationQuestion,
+    ElicitationRequest,
+)
 from omnigent_discord.approvals import (
     ElicitationCoordinator,
     ElicitationOutcome,
     Verdict,
 )
 from omnigent_discord.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_discord.events import (
-    ElicitationOption,
-    ElicitationQuestion,
-    ElicitationRequest,
-)
 from omnigent_discord.models import ChannelKey, DiscordTurn
 
 SERVER = "https://omnigent.example.com"

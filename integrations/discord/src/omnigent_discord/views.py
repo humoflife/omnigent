@@ -18,6 +18,7 @@ import logging
 from collections.abc import Awaitable, Callable
 
 import discord
+from omnigent_bot_core.events import ElicitationRequest
 
 from omnigent_discord.approvals import (
     NON_OWNER_NOTICE,
@@ -27,7 +28,6 @@ from omnigent_discord.approvals import (
     Verdict,
     question_options,
 )
-from omnigent_discord.events import ElicitationRequest
 
 _logger = logging.getLogger(__name__)
 

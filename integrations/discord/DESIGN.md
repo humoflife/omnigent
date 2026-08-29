@@ -21,17 +21,15 @@ Discord's transport genuinely differs, and are called out below.
 ## Relationship to the Slack integration
 
 `omnigent-discord` is a **sibling package** of `omnigent-slack`, not a layer on
-top of it. The harness-agnostic modules (`events.py`, `omnigent.py`, `oauth.py`)
-are deliberate copies: both packages are standalone distributions that never
-import `omnigent` core, and introducing a third shared package would couple two
-independently-deployed bots. Copying is only defensible with a mechanism to keep the copies honest, and
-this branch proves why: a turn-hang fixed in one copy once shipped while the
-sibling stayed broken. So `tests/test_sibling_drift.py` compares all three at
-AST level and fails on any divergence beyond the two that must differ (each
-package imports its own siblings; a log line names its platform), with
-deliberate differences registered alongside their reason. On top of that,
-`test_omnigent.py`, `test_oauth.py` and `test_auth_manager.py` pin the
-load-bearing behaviour here rather than assuming the Slack suite covers it.
+top of it. Both are standalone distributions that never import `omnigent` core:
+a bot drives the server over HTTP, so it needs the API contract, not the server
+implementation.
+
+What the two genuinely share — SSE parsing, the HTTP/SSE client and its turn
+loop, and the login flows — lives in **`omnigent-bot-core`**, which both depend
+on. Nothing in it knows what a Slack thread or a Discord channel is. It is a
+separate distribution from `omnigent-client` because that SDK depends on
+`omnigent` core, which would drag the whole server package into both bots.
 
 Everything that touches the chat surface — routing, streaming, cards, setup — is
 written for Discord, because the two platforms differ in ways that reach the
@@ -56,8 +54,6 @@ I/O at once.
 
 | Module | Responsibility |
 | --- | --- |
-| `events.py` | Pure SSE parsing + event DTOs + extractors (`extract_delta`, `session_status`, `extract_elicitation_request`, …). No I/O, no state. |
-| `omnigent.py` | HTTP/SSE client (`OmnigentClient`), connection pool, the `run_turn` stream loop and turn-end detection, error subclasses. |
 | `streaming.py` | The streamed-answer state machine: `_LiveReply` (edit cadence, rollover, seal) and `_AnswerReply` (placeholder lifecycle, seal-⇒-forget, tail reconciliation). Home of the `MessageableProtocol`/`MessageProtocol` structural types. |
 | `approvals.py` | Elicitation vocabulary, all pure: `ElicitationCoordinator`, `Card` builders, `ElicitationOutcome`, renderability rules, answer mapping. |
 | `views.py` | The only `discord.ui` code for cards — buttons/selects, the owner check, and `Card` → `discord.Embed`. |
@@ -65,7 +61,7 @@ I/O at once.
 | `notifications.py` | `DiscordNotifier` — all outbound messages (replies, private notices, todo plan, deflection notices) + the text formatters. |
 | `service.py` | `DiscordOmnigentService` — event acceptance, turn routing, turn lifecycle. |
 | `setup.py` | The `/omnigent` flow: pure card/option builders plus the selects and workspace modal. |
-| `auth_manager.py` / `oauth.py` / `tokens.py` | Login flows and token storage (encrypted at rest). |
+| `auth_manager.py` / `tokens.py` | Login orchestration and token storage (encrypted at rest). |
 | `store.py` | SQLite: channel→session mapping, per-user config, message de-duplication. |
 | `app.py` | discord.py wiring: intents, the client, the `/omnigent` command tree. |
 

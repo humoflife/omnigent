@@ -3512,6 +3512,17 @@ test = [
 ]
 
 [[package]]
+name = "omnigent-bot-core"
+version = "0.12.0.dev0"
+source = { editable = "integrations/bot-core" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.28.0" }]
+
+[[package]]
 name = "omnigent-client"
 version = "0.12.0.dev0"
 source = { editable = "sdks/python-client" }
@@ -3537,7 +3548,7 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "cryptography" },
     { name = "discord-py" },
-    { name = "httpx" },
+    { name = "omnigent-bot-core" },
     { name = "pydantic-settings" },
 ]
 
@@ -3547,7 +3558,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.21.0" },
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "discord-py", specifier = ">=2.4.0" },
-    { name = "httpx", specifier = ">=0.28.0" },
+    { name = "omnigent-bot-core", editable = "integrations/bot-core" },
     { name = "pydantic-settings", specifier = ">=2.10.0" },
 ]
 
@@ -3587,7 +3598,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "cryptography" },
-    { name = "httpx" },
+    { name = "omnigent-bot-core" },
     { name = "pydantic-settings" },
     { name = "slack-bolt" },
     { name = "slack-sdk" },
@@ -3598,7 +3609,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.12.0" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
     { name = "cryptography", specifier = ">=42.0.0" },
-    { name = "httpx", specifier = ">=0.28.0" },
+    { name = "omnigent-bot-core", editable = "integrations/bot-core" },
     { name = "pydantic-settings", specifier = ">=2.10.0" },
     { name = "slack-bolt", specifier = ">=1.29.0" },
     { name = "slack-sdk", specifier = ">=3.43.0" },

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from fakes import RecordingChannel
-from omnigent_discord.events import OutputFile
+from omnigent_bot_core.events import OutputFile
 from omnigent_discord.models import ChannelKey
 from omnigent_discord.notifications import (
     DiscordNotifier,

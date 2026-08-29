@@ -7,19 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from omnigent_discord.approvals import (
-    DEFAULT_ELICITATION_TIMEOUT_SECONDS,
-    ElicitationCoordinator,
-)
-from omnigent_discord.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_discord.models import ChannelKey, DiscordTurn
-from omnigent_discord.notifications import (
-    DiscordNotifier,
-    format_output_file,
-    format_policy_denied,
-    format_todos,
-)
-from omnigent_discord.omnigent import (
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
     HostUnavailableError,
@@ -35,6 +23,19 @@ from omnigent_discord.omnigent import (
     extract_output_file,
     extract_policy_denied,
     extract_todos,
+)
+
+from omnigent_discord.approvals import (
+    DEFAULT_ELICITATION_TIMEOUT_SECONDS,
+    ElicitationCoordinator,
+)
+from omnigent_discord.elicitation import ElicitationController, ElicitationTurnState
+from omnigent_discord.models import ChannelKey, DiscordTurn
+from omnigent_discord.notifications import (
+    DiscordNotifier,
+    format_output_file,
+    format_policy_denied,
+    format_todos,
 )
 from omnigent_discord.setup import (
     host_unavailable_text,

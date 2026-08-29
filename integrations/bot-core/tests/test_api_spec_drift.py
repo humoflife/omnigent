@@ -1,18 +1,18 @@
-"""Guard the Discord client against Omnigent API spec drift.
+"""Guard the bot client against Omnigent API spec drift.
 
-The Discord integration is deliberately decoupled from the ``omnigent`` server
+The bot integrations is deliberately decoupled from the ``omnigent`` server
 package (it can't import it), so it can't introspect the live FastAPI app. But
 the repo commits the server's generated OpenAPI document at ``openapi.json``
 (produced by ``scripts/dump_openapi.py`` and itself drift-guarded server-side by
 ``tests/server/test_openapi_drift.py``). That artifact is a reliable, in-repo
 description of the server contract.
 
-This test reconciles the endpoints the Discord client actually calls
+This test reconciles the endpoints the bot client actually calls
 (:data:`OMNIGENT_ENDPOINTS` in ``fakes.py``, kept next to the fake server) with
 that document, so:
 
 - If the server RENAMES or REMOVES a documented endpoint/method the bot depends
-  on (e.g. ``GET /v1/agents`` → ``GET /v1/available-agents``), a Discord test
+  on (e.g. ``GET /v1/agents`` → ``GET /v1/available-agents``), a bot-core test
   fails with a precise message — instead of the bot 404-ing silently against a
   deployed server.
 - If a field the client reads off a response schema disappears
@@ -24,7 +24,7 @@ The catalog is intentionally hand-maintained (it encodes *what the client
 needs*, which no tool can infer); this test is what keeps it honest against the
 server's own source of truth.
 
-If ``openapi.json`` can't be found (e.g. the Discord package is checked out in
+If ``openapi.json`` can't be found (e.g. this package is checked out in
 isolation without the parent repo), the reconciliation tests skip rather than
 fail — the catalog-consistency test still runs.
 """
@@ -38,7 +38,7 @@ from typing import Any
 import pytest
 from fakes import OMNIGENT_ENDPOINTS, OMNIGENT_RESPONSE_FIELDS
 
-# ``openapi.json`` lives at the monorepo root: integrations/discord/tests/ → ../../../
+# ``openapi.json`` lives at the monorepo root: integrations/bot-core/tests/ → ../../../
 _OPENAPI_PATH = Path(__file__).resolve().parents[3] / "openapi.json"
 
 
@@ -80,7 +80,7 @@ def test_documented_endpoint_present_in_openapi(method: str, path: str) -> None:
     assert _SPEC is not None
     paths = _SPEC["paths"]
     assert path in paths, (
-        f"{method} {path}: the Discord client calls this endpoint but it is gone "
+        f"{method} {path}: the bot client calls this endpoint but it is gone "
         f"from openapi.json — the server renamed/removed it, or the client and "
         f"server drifted. Update OmnigentClient and the fakes.py catalog together."
     )
@@ -103,7 +103,7 @@ def test_internal_endpoint_absent_from_openapi(method: str, path: str) -> None:
         return
     methods = {m.upper() for m in _SPEC["paths"][path]}
     assert method not in methods, (
-        f"{method} {path} is now in the public OpenAPI schema but the Discord "
+        f"{method} {path} is now in the public OpenAPI schema but the Slack "
         f"catalog marks it internal (documented=False). If this is intended, "
         f"flip it to documented=True in fakes.py's OMNIGENT_ENDPOINTS."
     )
@@ -125,6 +125,6 @@ def test_response_fields_present_in_schema(schema_name: str) -> None:
     properties = schemas[schema_name].get("properties", {})
     for field in OMNIGENT_RESPONSE_FIELDS[schema_name]:
         assert field in properties, (
-            f"{schema_name}.{field} is gone from openapi.json but the Discord client "
+            f"{schema_name}.{field} is gone from openapi.json but the bot client "
             f"reads it. Confirm the server rename and update the client + catalog."
         )

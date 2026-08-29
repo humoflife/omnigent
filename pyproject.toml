@@ -270,7 +270,8 @@ slack = [
 # lives in the separate `omnigent-discord` package (heavy deps — discord.py /
 # aiohttp — kept out of the baseline install), a sibling of `omnigent-slack`
 # rather than a layer on it: both are standalone bots that never import
-# `omnigent` core. The CLI launches it as a subprocess (`python -m
+# `omnigent` core, and both depend on `omnigent-bot-core` for the client they
+# share. The CLI launches it as a subprocess (`python -m
 # omnigent_discord`), so it must be importable in the same environment;
 # installing `omnigent[discord]` puts it there. Local/editable installs resolve
 # it from `integrations/discord` via [tool.uv.sources] below. Version-locked
@@ -429,6 +430,9 @@ omnigent-ui-sdk = { path = "sdks/ui", editable = true }
 # Local resolution for the `slack` extra. Only pulled in when `omnigent[slack]`
 # is requested (the extra is opt-in), so a default install never builds it.
 omnigent-slack = { path = "integrations/slack", editable = true }
+# The client both bots share. Pulled in transitively by either bot extra;
+# listed here so an editable checkout resolves it from the tree.
+omnigent-bot-core = { path = "integrations/bot-core", editable = true }
 # Local resolution for the `discord` extra. Only pulled in when
 # `omnigent[discord]` is requested (the extra is opt-in), so a default install
 # never builds it.
@@ -670,6 +674,12 @@ known-first-party = ["omnigent"]
 # has deliberate boundary catches (best-effort edits, private notices,
 # background login tasks) that must never abort a turn, hence BLE001.
 "integrations/discord/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+# The shared bot client has deliberate boundary catches (a readiness probe or a
+# best-effort snapshot must never abort a turn) and test doubles whose
+# signatures must match the real callables they stand in for.
+"integrations/bot-core/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
 # The sessions route is a facade over an implementation package. Its explicit

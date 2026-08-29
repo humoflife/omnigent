@@ -12,14 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from omnigent_discord.models import UserConfig
-from omnigent_discord.oauth import DeviceGrantUnavailableError, OAuthError, PendingLogin
-from omnigent_discord.omnigent import (
+from omnigent_bot_core.oauth import DeviceGrantUnavailableError, OAuthError, PendingLogin
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     OmnigentError,
     ServerUnreachableError,
     ValidatedServer,
 )
+from omnigent_discord.models import UserConfig
 from omnigent_discord.setup import (
     SetupFlow,
     agent_options,

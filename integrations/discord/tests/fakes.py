@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 import respx
-from omnigent_discord.events import SessionActivity, SessionInfo
+from omnigent_bot_core.events import SessionActivity, SessionInfo
 
 # The placeholder text the bot streams its reply into. Kept in sync with the
 # service module so a recorded placeholder is recognizable.

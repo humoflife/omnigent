@@ -27,14 +27,14 @@ from fakes import (
     resolved_event,
     status_event,
 )
-from omnigent_discord.events import SessionActivity
-from omnigent_discord.models import ChannelKey, UserConfig
-from omnigent_discord.notifications import DiscordNotifier
-from omnigent_discord.omnigent import (
+from omnigent_bot_core.events import SessionActivity
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HostUnavailableError,
     ServerUnreachableError,
 )
+from omnigent_discord.models import ChannelKey, UserConfig
+from omnigent_discord.notifications import DiscordNotifier
 from omnigent_discord.service import DiscordOmnigentService, thread_name_for
 from omnigent_discord.store import SQLiteStore
 

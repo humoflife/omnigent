@@ -3,6 +3,11 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from omnigent_bot_core.events import (
+    ElicitationOption,
+    ElicitationQuestion,
+    ElicitationRequest,
+)
 from omnigent_discord.approvals import (
     MAX_FORM_QUESTIONS,
     RESOLVED_EXTERNALLY,
@@ -15,11 +20,6 @@ from omnigent_discord.approvals import (
     question_options,
     resolve_form_answers,
     resolved_card,
-)
-from omnigent_discord.events import (
-    ElicitationOption,
-    ElicitationQuestion,
-    ElicitationRequest,
 )
 from omnigent_discord.text import MAX_SELECT_OPTIONS
 

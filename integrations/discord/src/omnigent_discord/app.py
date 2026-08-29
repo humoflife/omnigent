@@ -14,11 +14,11 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from omnigent_bot_core.omnigent import OmnigentClientPool
 
 from omnigent_discord.auth_manager import AuthManager
 from omnigent_discord.config import ConfigError, Settings, load_settings
 from omnigent_discord.notifications import DiscordNotifier
-from omnigent_discord.omnigent import OmnigentClientPool
 from omnigent_discord.service import DiscordOmnigentService
 from omnigent_discord.setup import COMMAND_NAME, SetupFlow
 from omnigent_discord.store import SQLiteStore

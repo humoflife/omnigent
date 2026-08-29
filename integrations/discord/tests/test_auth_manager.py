@@ -11,14 +11,14 @@ import asyncio
 from typing import Any
 
 import pytest
-from omnigent_discord.auth_manager import AuthManager, discord_client_id
-from omnigent_discord.oauth import (
+from omnigent_bot_core.oauth import (
     AuthorizationDeniedError,
     AuthorizationExpiredError,
     OAuthError,
     PendingLogin,
     TokenResult,
 )
+from omnigent_discord.auth_manager import AuthManager, discord_client_id
 from omnigent_discord.tokens import InMemoryTokenStore
 
 SERVER = "https://omnigent.example.com"

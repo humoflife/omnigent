@@ -22,6 +22,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from omnigent_bot_core.events import ElicitationRequest
+from omnigent_bot_core.omnigent import OmnigentClient
+
 from omnigent_discord.approvals import (
     RESOLVED_EXTERNALLY,
     ClickTarget,
@@ -33,9 +36,7 @@ from omnigent_discord.approvals import (
     resolve_form_answers,
     resolved_card,
 )
-from omnigent_discord.events import ElicitationRequest
 from omnigent_discord.models import ChannelKey, DiscordTurn
-from omnigent_discord.omnigent import OmnigentClient
 from omnigent_discord.views import ElicitationView, to_embed
 
 if TYPE_CHECKING:

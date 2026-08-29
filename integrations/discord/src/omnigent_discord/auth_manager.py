@@ -21,7 +21,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from omnigent_discord.oauth import (
+from omnigent_bot_core.oauth import (
     AuthorizationDeniedError,
     AuthorizationExpiredError,
     DeviceFlowClient,
@@ -30,7 +30,8 @@ from omnigent_discord.oauth import (
     TokenResult,
     start_login,
 )
-from omnigent_discord.omnigent import ClientAuth, TokenRefreshTransientError
+from omnigent_bot_core.omnigent import ClientAuth, TokenRefreshTransientError
+
 from omnigent_discord.tokens import TokenStore
 
 _logger = logging.getLogger(__name__)

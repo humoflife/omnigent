@@ -1,7 +1,7 @@
 """
 Bump the omnigent project version across all packages in lockstep.
 
-The five distributions in this repo release together at a single
+The six distributions in this repo release together at a single
 version:
 
 - ``omnigent``         — root ``pyproject.toml``
@@ -9,6 +9,7 @@ version:
 - ``omnigent-ui-sdk``  — ``sdks/ui/pyproject.toml``
 - ``omnigent-slack``   — ``integrations/slack/pyproject.toml``
 - ``omnigent-discord`` — ``integrations/discord/pyproject.toml``
+- ``omnigent-bot-core`` — ``integrations/bot-core/pyproject.toml``
 
 Each declares its own ``[project].version``. The first three ``==``-pin
 their siblings in ``[project].dependencies``; the root ``omnigent``
@@ -93,7 +94,7 @@ def packages(root: Path) -> list[Package]:
     Return the lockstep packages with their paths rooted at *root*.
 
     :param root: Repo root, e.g. ``Path("/repo")``.
-    :returns: The five :class:`Package` entries.
+    :returns: The six :class:`Package` entries.
     """
     return [
         Package(
@@ -120,7 +121,7 @@ def packages(root: Path) -> list[Package]:
         Package(
             "omnigent-slack",
             root / "integrations" / "slack" / "pyproject.toml",
-            (),
+            ("omnigent-bot-core",),
         ),
         # omnigent-discord is a sibling of omnigent-slack with the same
         # decoupling: it drives the server over HTTP and never imports
@@ -129,6 +130,13 @@ def packages(root: Path) -> list[Package]:
         Package(
             "omnigent-discord",
             root / "integrations" / "discord" / "pyproject.toml",
+            ("omnigent-bot-core",),
+        ),
+        # The client both bots share. It pins no siblings — it is the bottom of
+        # this dependency chain and imports neither bot nor omnigent core.
+        Package(
+            "omnigent-bot-core",
+            root / "integrations" / "bot-core" / "pyproject.toml",
             (),
         ),
     ]

@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from omnigent_discord.events import ElicitationRequest
+from omnigent_bot_core.events import ElicitationRequest
+
 from omnigent_discord.text import (
     EMBED_DESCRIPTION_LIMIT,
     EMBED_FIELD_VALUE_LIMIT,

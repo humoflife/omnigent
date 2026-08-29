@@ -23,6 +23,16 @@ from pathlib import Path
 from typing import Any
 
 import discord
+from omnigent_bot_core.events import host_id_of
+from omnigent_bot_core.oauth import DeviceGrantUnavailableError, OAuthError
+from omnigent_bot_core.omnigent import (
+    AuthRequiredError,
+    OmnigentClient,
+    OmnigentClientPool,
+    OmnigentError,
+    ServerUnreachableError,
+    ValidatedServer,
+)
 
 from omnigent_discord.approvals import (
     COLOR_NEGATIVE,
@@ -31,17 +41,7 @@ from omnigent_discord.approvals import (
     Card,
 )
 from omnigent_discord.auth_manager import AuthManager, discord_client_id
-from omnigent_discord.events import host_id_of
 from omnigent_discord.models import UserConfig
-from omnigent_discord.oauth import DeviceGrantUnavailableError, OAuthError
-from omnigent_discord.omnigent import (
-    AuthRequiredError,
-    OmnigentClient,
-    OmnigentClientPool,
-    OmnigentError,
-    ServerUnreachableError,
-    ValidatedServer,
-)
 from omnigent_discord.store import SQLiteStore
 from omnigent_discord.text import MAX_SELECT_OPTIONS, truncate_option
 from omnigent_discord.views import to_embed

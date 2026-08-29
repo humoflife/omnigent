@@ -2,10 +2,10 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
-import omnigent_slack.omnigent as omnigent_module
+import omnigent_bot_core.omnigent as omnigent_module
 import pytest
 import respx
-from omnigent_slack.omnigent import (
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
     HostUnavailableError,
@@ -1335,9 +1335,8 @@ async def test_harness_that_never_starts_ends_turn_immediately() -> None:
     with NO ``running`` edge and no delta, so the id-less ``failed`` that
     follows must not be dismissed as a status replayed from before the turn.
     Getting this wrong strands the user on an unchanging placeholder until the
-    idle grace expires, minutes after the server already said the turn was
-    dead. Observed live on the Discord sibling against claude-native without
-    tmux; this client runs the identical loop.
+    idle grace expires, minutes after the server already called the turn dead.
+    Found live against claude-native on a machine without tmux.
     """
     body = (
         'data: {"type":"session.input.consumed"}\n\n'
@@ -1362,3 +1361,6 @@ async def test_harness_that_never_starts_ends_turn_immediately() -> None:
     types = [e.get("type") for e in events]
     assert types[-1] == "session.status"
     assert "session.heartbeat" not in types
+    # The caller reads ``response.error`` to mark the turn errored, so ending
+    # promptly must not swallow it on the way out.
+    assert "response.error" in types
