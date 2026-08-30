@@ -5,9 +5,13 @@ response** the bot edits in place: "Connecting…" → (if the server needs auth
 sign-in link → agent/host selects → a workspace modal → a saved confirmation.
 Two Discord constraints shape the flow:
 
-- A modal may contain only text inputs, so the agent and host are chosen with
-  select menus on the ephemeral message and only the workspace path lives in a
-  modal (opened from the Save button, which is a fresh interaction).
+- A modal opens only in response to an interaction, never as the first reply to
+  a command that has already been deferred. So the agent and host are chosen
+  with select menus on the ephemeral message, and the Save button — a fresh
+  interaction — opens the modal that collects the workspace path. The result is
+  two steps where the Slack sibling shows one form. (``discord.ui.Label``, added
+  in discord.py 2.6, suggests a modern modal can also hold selects, which would
+  allow a single form; untested here, so the flow is left as built.)
 - An interaction token is valid for 15 minutes, which comfortably covers a
   device-grant login (the code itself expires in 10).
 

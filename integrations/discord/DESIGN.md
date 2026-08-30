@@ -41,7 +41,7 @@ design:
 | Threads | Every message has a `thread_ts`; DMs thread too | Real threads in guilds; **DMs have none at all** |
 | Private notice | `chat.postEphemeral` anywhere | Ephemeral only in an **interaction response** — otherwise a DM, or a self-deleting channel message |
 | Identity | User id is per-workspace, so keys are `(team, user)` | Snowflakes are **global**, so a bare user id is the key |
-| Forms | Modals hold selects; option value cap 75 chars | Modals hold **text inputs only**; ≤5 action rows, ≤25 options, value cap 100 |
+| Forms | Modals hold selects; option value cap 75 chars | ≤5 action rows, ≤25 options, value cap 100; a modal opens only from an interaction |
 | Emoji | `:shortcode:` renders | Shortcodes are sent verbatim — **Unicode only** |
 | Mentions | `@channel` in bot text is inert | Discord parses mentions out of raw content, so agent output could ping a server — the client denies all mentions by default |
 | Slash commands | available everywhere once installed | A **guild**-scoped command is invisible in DMs; only a **global** one reaches them |
