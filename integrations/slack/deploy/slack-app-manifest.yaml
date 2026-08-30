@@ -22,6 +22,16 @@ features:
   bot_user:
     display_name: Omnigent
     always_online: false
+  app_home:
+    # The messages tab is what lets a user DM the bot at all, and it defaults
+    # to OFF. Without it the bot holds im:history and im:write yet nobody can
+    # send it anything — and DMs are a first-class entry point, so the setup
+    # prompt and logout confirmation would arrive in a conversation the user
+    # cannot reply in.
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+    # The bot publishes no Home view.
+    home_tab_enabled: false
   slash_commands:
     - command: /omnigent
       # Socket Mode delivers the payload over the websocket and ignores this
