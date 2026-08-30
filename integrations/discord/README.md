@@ -257,6 +257,47 @@ continues it.
 For the full set of user-facing behaviours see
 **[docs/CUJS.md](docs/CUJS.md)**.
 
+## Attached files
+
+**Off by default.** The operator sets `OMNIGENT_DISCORD_ALLOW_FILE_UPLOAD=true`
+to turn it on. While it is off, attachments are ignored and the sender is told
+why; the message itself still runs, so a caption is never lost with its file.
+
+There is no per-user setting to go with it. The user is asked to approve the
+upload the first time they send a file in a session, which is the same consent a
+stored preference would collect, asked at a more useful moment.
+
+Once on, a file rides to the agent as a content block holding a base64 data URI,
+which the host writes to disk for the harness to read. Reading one costs nothing
+extra in permissions, but note the bot needs **MESSAGE CONTENT INTENT** to see
+attachments at all, the same intent it needs to read message text.
+
+Every limit is a refusal rather than a truncation, so a file is either sent whole
+or not sent:
+
+| Guard | Default | Override |
+| --- | --- | --- |
+| Per-file size | 8 MB | `OMNIGENT_DISCORD_MAX_ATTACHMENT_BYTES` |
+| Files per message | 5 | `OMNIGENT_DISCORD_MAX_ATTACHMENTS` |
+| Free disk | 3x the file's size | not configurable |
+
+The size is checked twice: against what Discord reports, before downloading, and
+against the bytes actually received, because the reported size is a claim rather
+than a guarantee.
+
+**Types are an allow-list.** Images (`png`, `jpg`, `jpeg`, `gif`, `webp`) become
+`input_image` blocks; documents, data and source files (`pdf`, `txt`, `md`, `csv`,
+`json`, `yaml`, `toml`, `log`, `html`, `css`, `xml`, and common source
+extensions) become `input_file` blocks. Anything else is refused, so a new
+dangerous extension does not become forwardable by default. Executables
+(`.exe`, `.sh`, `.dll`, `.dmg`, and similar) are named in the refusal, since
+someone attaching one is usually trying to get the agent to run it. They are
+never downloaded, only rejected on the filename.
+
+Turning uploads on lets any user who can reach the bot put a file on the host
+that runs their agent, bounded by the guards above. That is why the operator
+switch exists and why it starts closed.
+
 ## Running alongside the Slack bot
 
 Both bots can run at once against the same Omnigent server, on the same

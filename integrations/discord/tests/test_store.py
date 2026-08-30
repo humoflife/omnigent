@@ -124,3 +124,12 @@ async def test_claim_event_prunes_entries_past_the_ttl(
     monkeypatch.setattr(store_module.time, "time", lambda: now + 8 * 24 * 60 * 60)
     await store.claim_event("new")
     assert await store.claim_event("old") is True
+
+
+async def test_initialize_is_safe_to_run_twice(tmp_path: Path) -> None:
+    # The migration checks for its column, so a second start must not fail on
+    # a duplicate ALTER.
+    store = SQLiteStore(tmp_path / "bot.sqlite3")
+    await store.initialize()
+    await store.initialize()
+    assert await store.get_user_config("nobody") is None

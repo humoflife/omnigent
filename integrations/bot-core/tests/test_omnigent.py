@@ -1343,7 +1343,8 @@ async def test_harness_that_never_starts_ends_turn_immediately() -> None:
         'data: {"type":"response.error","error":{"message":'
         '"Native Claude terminal failed to start"}}\n\n'
         'data: {"type":"session.status","status":"failed"}\n\n'
-        'data: {"type":"session.heartbeat"}\n\n'  # must never be reached
+        # Must never be reached: the turn ends on the failure above.
+        'data: {"type":"session.heartbeat"}\n\n'
     )
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(202, json={})

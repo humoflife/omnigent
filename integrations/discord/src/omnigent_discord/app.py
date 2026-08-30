@@ -306,6 +306,9 @@ async def run() -> None:
         server_url=settings.server_url,
         guild_allowed=settings.guild_allowed,
         stream_edit_interval_seconds=settings.stream_edit_interval_seconds,
+        allow_file_upload=settings.allow_file_upload,
+        max_attachment_bytes=settings.max_attachment_bytes,
+        max_attachments_per_message=settings.max_attachments_per_message,
     )
 
     client = OmnigentClient(settings, service)

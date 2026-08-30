@@ -102,6 +102,31 @@ class Settings(BaseSettings):
         validation_alias="OMNIGENT_DISCORD_COMMAND_GUILD_IDS",
     )
 
+    # OPERATOR gate for reading attached files, off by default. Fetching a file
+    # an arbitrary Discord user attached is the only place this bot pulls
+    # unbounded bytes from the network and hands them to an agent, so it stays
+    # closed until someone running the bot opens it. A user must ALSO opt in via
+    # ``/omnigent config``; either side being off means no file is sent.
+    allow_file_upload: bool = Field(
+        default=False,
+        validation_alias="OMNIGENT_DISCORD_ALLOW_FILE_UPLOAD",
+    )
+
+    # Per-file ceiling. Discord itself caps uploads well above this; the point
+    # here is to bound what one message can push through the server, not to
+    # mirror Discord's limit.
+    max_attachment_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        validation_alias="OMNIGENT_DISCORD_MAX_ATTACHMENT_BYTES",
+    )
+
+    # Per-message ceiling, so one message cannot queue an unbounded number of
+    # downloads.
+    max_attachments_per_message: int = Field(
+        default=5,
+        validation_alias="OMNIGENT_DISCORD_MAX_ATTACHMENTS",
+    )
+
     # Optional shared secret proving this bot is an authorized device-grant
     # client. When the Omnigent server has OMNIGENT_DEVICE_CLIENT_SECRET set,
     # this must match; the bot sends it in the X-Omnigent-Client-Secret header

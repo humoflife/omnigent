@@ -29,6 +29,8 @@ from omnigent_discord.approvals import (
     DEFAULT_ELICITATION_TIMEOUT_SECONDS,
     ElicitationCoordinator,
 )
+from omnigent_discord.attachments import AttachmentPolicy
+from omnigent_discord.attachments import collect as collect_attachments
 from omnigent_discord.elicitation import ElicitationController, ElicitationTurnState
 from omnigent_discord.models import ChannelKey, DiscordTurn
 from omnigent_discord.notifications import (
@@ -183,6 +185,9 @@ class DiscordOmnigentService:
         elicitations: ElicitationCoordinator | None = None,
         elicitation_timeout_seconds: float = DEFAULT_ELICITATION_TIMEOUT_SECONDS,
         stream_edit_interval_seconds: float = 1.0,
+        allow_file_upload: bool = False,
+        max_attachment_bytes: int = 8 * 1024 * 1024,
+        max_attachments_per_message: int = 5,
     ) -> None:
         self._store = store
         self._pool = pool
@@ -193,6 +198,11 @@ class DiscordOmnigentService:
         self._bot_user_id = bot_user_id
         self._guild_allowed = guild_allowed or (lambda _guild_id: True)
         self._stream_edit_interval = stream_edit_interval_seconds
+        # The operator's switch. The user approves each upload as it happens,
+        # so there is no per-user preference stored alongside this.
+        self._allow_file_upload = allow_file_upload
+        self._max_attachment_bytes = max_attachment_bytes
+        self._max_attachments_per_message = max_attachments_per_message
         self._logger = logging.getLogger(__name__)
         self._notifier = notifier
         # Bridges an in-flight elicitation card to the interaction that answers
@@ -336,6 +346,7 @@ class DiscordOmnigentService:
                 text=text,
                 requester=requester,
                 title=self._session_title(message),
+                attachments=list(getattr(message, "attachments", None) or []),
             )
         except Exception:
             await self._store.unclaim_event(str(message.id))
@@ -356,7 +367,7 @@ class DiscordOmnigentService:
         # A mention may still be present (a DM, or the owner @-ing the bot in
         # its own thread) — strip it and treat the rest as the prompt.
         text = strip_bot_mention(raw_text, self._bot_user_id)
-        if not text:
+        if not text and not getattr(message, "attachments", None):
             self._logger.info("Ignoring empty Discord message channel=%s", key.display())
             await self._store.unclaim_event(str(message.id))
             return
@@ -368,6 +379,7 @@ class DiscordOmnigentService:
                 text=text,
                 requester=requester,
                 title=self._session_title(message),
+                attachments=list(getattr(message, "attachments", None) or []),
             )
         except Exception:
             # Handling failed before the turn was underway; release the claim so
@@ -487,6 +499,37 @@ class DiscordOmnigentService:
 
     # ── turn routing ──────────────────────────────────────────────────────
 
+    async def _collect_attachments(
+        self,
+        channel: MessageableProtocol,
+        key: ChannelKey,
+        requester: str,
+        attachments: list[Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Fetch allowed attachments, telling the user about any that were not.
+
+        The operator switch is the only gate here. The user is asked to approve
+        the upload itself when it happens, so a stored per-user opt-in would ask
+        the same question earlier and less usefully.
+        """
+        if not attachments:
+            return []
+        policy = AttachmentPolicy(
+            enabled=self._allow_file_upload,
+            max_bytes=self._max_attachment_bytes,
+            max_count=self._max_attachments_per_message,
+        )
+        result = await collect_attachments(attachments, policy)
+        if result.skipped:
+            self._logger.info(
+                "Skipped %d attachment(s) channel=%s user=%s",
+                len(result.skipped),
+                key.display(),
+                requester,
+            )
+            await self._notifier.post_private(channel, key, requester, result.notice)
+        return result.blocks
+
     async def _route_turn(
         self,
         *,
@@ -495,6 +538,7 @@ class DiscordOmnigentService:
         text: str,
         requester: str,
         title: str,
+        attachments: list[Any] | None = None,
     ) -> None:
         # LOCAL concurrency guard: reserve the channel SYNCHRONOUSLY here (no
         # await before this add) so two near-simultaneous messages can't both
@@ -533,6 +577,7 @@ class DiscordOmnigentService:
         self._active_channels.add(key)
         spawned = False
         try:
+            blocks = await self._collect_attachments(channel, key, requester, attachments)
             record = await self._store.get_session(key)
 
             if record is not None:
@@ -575,6 +620,7 @@ class DiscordOmnigentService:
                     DiscordTurn(
                         key=key,
                         text=text,
+                        blocks=blocks,
                         user_id=requester,
                         create_if_missing=False,
                         # Title is only used when creating a session; an existing
@@ -604,6 +650,7 @@ class DiscordOmnigentService:
                 DiscordTurn(
                     key=key,
                     text=text,
+                    blocks=blocks,
                     user_id=requester,
                     create_if_missing=True,
                     title=title,
@@ -862,7 +909,11 @@ class DiscordOmnigentService:
             # windows (a timeout must NOT cancel it — that would end the
             # generator); we re-await it next window.
             events = omnigent.run_turn(
-                session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
+                session_id,
+                turn.text,
+                blocks=turn.blocks,
+                workspace=turn.workspace,
+                host_id=turn.host_id,
             ).__aiter__()
             pending: asyncio.Task[dict[str, Any]] | None = None
             try:

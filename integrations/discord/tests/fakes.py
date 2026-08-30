@@ -165,6 +165,7 @@ class IncomingMessage:
         mentions: list[FakeUser] | None = None,
         role_mentions: list[FakeRole] | None = None,
         message_id: str | None = None,
+        attachments: list[Any] | None = None,
     ) -> None:
         if message_id is None:
             IncomingMessage._next_id += 1
@@ -176,6 +177,7 @@ class IncomingMessage:
         self.guild = guild
         self.mentions = mentions or []
         self.role_mentions = role_mentions or []
+        self.attachments = attachments or []
         self.jump_url = f"https://discord.com/channels/x/{channel.id}/{self.id}"
         # The thread ``create_thread`` will return, and whether it should fail.
         self.thread: FakeThread | None = None
@@ -227,6 +229,8 @@ class FakeOmnigent:
         self.created: list[tuple[str, str]] = []
         self.launched: list[dict[str, Any]] = []
         self.submitted: list[str] = []
+        # Attachment blocks per turn, parallel to ``submitted``.
+        self.submitted_blocks: list[list[dict[str, Any]]] = []
         self.resolved: list[dict[str, Any]] = []
         # Raise this instead of streaming, to exercise the error paths.
         self.turn_error: Exception | None = None
@@ -282,8 +286,9 @@ class FakeOmnigent:
             }
         )
 
-    async def run_turn(self, session_id: str, text: str, **_kwargs: Any) -> Any:
+    async def run_turn(self, session_id: str, text: str, **kwargs: Any) -> Any:
         self.submitted.append(text)
+        self.submitted_blocks.append(list(kwargs.get("blocks") or []))
         self._turns += 1
         self.turn_started.set()
         if self.turn_error is not None:
