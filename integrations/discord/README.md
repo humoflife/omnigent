@@ -101,14 +101,6 @@ checked alongside it. Treat `/omnigent` as a server-channel command.
 which appears within seconds and is handy while iterating. The bot logs a
 warning when you are in this mode.
 
-**Known limitation: a DM has no clean session reset.** `/omnigent new` resets the
-channel it is invoked in, and a DM has no threads, so a DM stays bound to one
-Omnigent session, with no expiry on the mapping. The only reset reachable from
-elsewhere is `/omnigent logout` in a server channel, which clears every session
-the user owns but also their agent/host/workspace choice, so they must run
-`/omnigent config` again. `/omnigent config` is otherwise unaffected: it is
-stored per Discord account, so running it in a channel covers the DM too.
-
 ## Running the bot
 
 With the `omni` CLI installed, the Discord bot is managed like the Slack one:
