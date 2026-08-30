@@ -44,7 +44,7 @@ design:
 | Forms | Modals hold selects; option value cap 75 chars | ≤5 action rows, ≤25 options, value cap 100; a modal opens only from an interaction |
 | Emoji | `:shortcode:` renders | Shortcodes are sent verbatim — **Unicode only** |
 | Mentions | `@channel` in bot text is inert | Discord parses mentions out of raw content, so agent output could ping a server — the client denies all mentions by default |
-| Slash commands | available everywhere once installed | A **guild**-scoped command is invisible in DMs; only a **global** one reaches them |
+| Slash commands | available everywhere once installed | A **guild**-scoped command is invisible in DMs; a **global** one is required, but in testing still did not surface in a bot DM |
 | Install | A workspace admin installs the app | Anyone with Manage Server can add the bot — hence a **guild allow-list** |
 
 ## Module layout

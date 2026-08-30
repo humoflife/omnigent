@@ -218,10 +218,9 @@ class DiscordOmnigentService:
         # signal (web-UI busy / pending action).
         self._active_channels: set[ChannelKey] = set()
         # In-flight turn tasks, tracked so shutdown can cancel them — and keyed
-        # by channel so the owner can cancel their own stuck turn. Without that,
-        # a turn that never terminates holds the reservation forever and, in a
-        # DM (no threads, so /omnigent new is the only reset), leaves the user
-        # with no way back short of a bot restart.
+        # by channel so the owner can cancel their own stuck turn. The idle
+        # grace eventually ends a wedged turn on its own, but that is ten
+        # minutes of a channel the owner cannot use.
         self._turn_tasks: set[asyncio.Task[None]] = set()
         self._turns_by_channel: dict[ChannelKey, asyncio.Task[None]] = {}
 

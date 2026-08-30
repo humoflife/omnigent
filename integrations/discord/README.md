@@ -35,6 +35,9 @@ Omnigent identity against it.
    checkout, `uv sync --extra discord`). It must land in the same environment as
    `omni`.
 6. Run the bot — see **Running the bot** below.
+7. In a channel the bot is in, run **`/omnigent config`** and pick an agent,
+   a host, and a workspace. This is per Discord account, not per server, so
+   each user does it once. See **Per-user setup flow** below.
 
 ## Required permissions and intents
 
@@ -88,15 +91,23 @@ with the bot open a DM with it, and a DM carries no guild to filter on — so a
 member of an unapproved guild could still start a session by DM. That is why
 *Public Bot* off is the control that matters.
 
-`/omnigent` is registered **globally** by default, which is what makes it work
-in DMs — Discord routes DM interactions only to globally-registered commands.
-Allow a few minutes after first start for it to appear.
+`/omnigent` is registered **globally** by default. Guild-scoped registration is
+DM-blind, so a global registration is the prerequisite for a DM ever showing the
+command. It does not appear to be sufficient: in testing, a guild-installed
+bot's commands did not surface in a DM with it, and neither did another bot's
+checked alongside it. Treat `/omnigent` as a server-channel command.
 
 `OMNIGENT_DISCORD_COMMAND_GUILD_IDS` opts into per-guild registration instead,
-which appears within seconds and is handy while iterating. The trade is that a
-guild command is **DM-blind**: `/omnigent` vanishes from DMs, including
-`/omnigent new`, the only way to end a DM session. The bot logs a warning when
-you are in this mode.
+which appears within seconds and is handy while iterating. The bot logs a
+warning when you are in this mode.
+
+**Known limitation: a DM has no clean session reset.** `/omnigent new` resets the
+channel it is invoked in, and a DM has no threads, so a DM stays bound to one
+Omnigent session, with no expiry on the mapping. The only reset reachable from
+elsewhere is `/omnigent logout` in a server channel, which clears every session
+the user owns but also their agent/host/workspace choice, so they must run
+`/omnigent config` again. `/omnigent config` is otherwise unaffected: it is
+stored per Discord account, so running it in a channel covers the DM too.
 
 ## Running the bot
 
@@ -315,6 +326,6 @@ logging. The usual causes, in order of likelihood:
 | "I need the Create Public Threads permission" | Grant it in that channel, or DM the bot instead. |
 | "No online host is available" | Start one: `omni host --server <url>` (or `omni start` locally). |
 | `Discord rejected the bot token` | `OMNIGENT_DISCORD_BOT_TOKEN` is wrong or was regenerated. |
-| `/omnigent` missing in DMs | `OMNIGENT_DISCORD_COMMAND_GUILD_IDS` is set — guild commands are DM-blind. Unset it. |
+| `/omnigent` missing in DMs | Expected: a guild-installed bot's commands do not surface in DMs. Run it in a server channel. Setting `OMNIGENT_DISCORD_COMMAND_GUILD_IDS` also removes it from DMs, so unset that too. |
 | Reply says the harness failed to start | The harness needs setup on the host — e.g. `claude-native` needs `tmux` installed. Check the runner log the message names. |
 | Setup says the server "answered, but with an error" | It is reachable, so check that log — and that `OMNIGENT_SERVER_URL` isn't pointing at an older server still holding the port. |
