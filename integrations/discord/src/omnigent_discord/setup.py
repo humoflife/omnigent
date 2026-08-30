@@ -206,10 +206,17 @@ def saved_card(config: UserConfig, server_url: str) -> Card:
 
 
 def setup_required_text() -> str:
-    """The nudge sent to a user who hasn't configured yet."""
+    """The nudge sent to a user who hasn't configured yet.
+
+    Names a server channel because this often arrives in a DM, where a slash
+    command may not be available: a command reaches DMs only once its global
+    registration has propagated, and a freshly-started bot has not. Setup is
+    per-account, so configuring from a channel applies to the DM too.
+    """
     return (
-        "👋 Set up Omnigent before we start — run **/omnigent config** and pick "
-        "an agent, a host, and a workspace."
+        "👋 Set up Omnigent before we start — run **/omnigent config** in a "
+        "server channel and pick an agent, a host, and a workspace. It applies "
+        "everywhere, including here."
     )
 
 

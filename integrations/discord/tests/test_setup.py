@@ -219,6 +219,9 @@ def test_no_host_guidance_names_the_command_and_the_server() -> None:
 
 def test_setup_and_relogin_nudges_name_the_command() -> None:
     assert "/omnigent config" in setup_required_text()
+    # This nudge often lands in a DM, where the command may not be available —
+    # so it has to say where to run it.
+    assert "server channel" in setup_required_text()
     assert "/omnigent config" in relogin_required_text()
 
 
