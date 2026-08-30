@@ -286,8 +286,8 @@ async def test_finish_pending_leaves_an_already_finalized_card_alone() -> None:
 
 
 async def test_timed_out_decline_that_also_failed_is_re_declined() -> None:
-    # Nothing reached the server, so the park is still open — re-declining is
-    # the only way the session isn't wedged, while the label stays honest.
+    # Nothing reached the server, so the park is still open. Re-declining is the
+    # only way the session isn't wedged, and the label still matches the state.
     channel, client = RecordingChannel(), FakeOmnigent()
     client.resolve_error = RuntimeError("network down")
     coordinator = ElicitationCoordinator(0.01)
