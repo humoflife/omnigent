@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,7 @@ async def test_claim_event_prunes_entries_past_the_ttl(
     await store.claim_event("old")
     # Jump a week ahead: the next claim's prune sweeps the stale marker, so the
     # dedup table can't grow without bound.
-    now = int(__import__("time").time())
+    now = int(time.time())
     monkeypatch.setattr(store_module.time, "time", lambda: now + 8 * 24 * 60 * 60)
     await store.claim_event("new")
     assert await store.claim_event("old") is True

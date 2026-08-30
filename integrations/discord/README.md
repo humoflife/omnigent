@@ -283,7 +283,7 @@ server.
 ## Development
 
 This integration is a **separate package** (`omnigent-discord`) with heavy deps
-(discord.py, aiohttp) kept out of the core `omnigent` install. It is a **sibling**
+(discord.py and its HTTP stack) kept out of the core `omnigent` install. It is a **sibling**
 of `omnigent-slack`, not a layer on it: both are standalone bots that never
 import `omnigent` core. It resolves as an editable path dep of the root
 `omnigent` package via the `discord` extra (see `[tool.uv.sources]` in the root
