@@ -754,7 +754,7 @@ async def test_mention_of_the_bots_own_role_counts_as_addressing_it(
     # autocomplete beside the bot itself, so users routinely pick the role.
     # Observed live: the message arrives with mentions=[] and role_mentions=[…],
     # and the bot answered nothing.
-    own_role = FakeRole("1542936703767937087", bot_id=BOT_ID)
+    own_role = FakeRole("700000000000000007", bot_id=BOT_ID)
     message = IncomingMessage(
         content=f"<@&{own_role.id}> what files are in this repo?",
         author=OWNER,

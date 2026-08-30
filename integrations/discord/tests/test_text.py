@@ -59,7 +59,7 @@ def test_strip_bot_mention_removes_the_bots_role_form_too() -> None:
     # Discord's autocomplete offers a bot's managed role alongside the bot, so
     # the prompt often arrives addressed to `<@&roleid>` — whose id is the
     # role's, not the bot's. Left in place it would ride into the agent prompt.
-    assert strip_bot_mention("<@&1542936703767937087> do the thing", "42") == "do the thing"
+    assert strip_bot_mention("<@&700000000000000007> do the thing", "42") == "do the thing"
 
 
 def test_role_mention_mid_sentence_is_left_alone() -> None:

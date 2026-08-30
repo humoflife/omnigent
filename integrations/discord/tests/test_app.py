@@ -106,7 +106,7 @@ async def test_bot_only_invite_is_reported_with_the_fix_not_a_traceback(
 
 
 async def test_refused_guild_is_named(caplog: pytest.LogCaptureFixture) -> None:
-    client = _client("1498911215865561122")
+    client = _client("900000000000000001")
 
     async def refuse(**_kwargs: Any) -> None:
         raise discord.Forbidden(_FakeResponse(), "Missing Access")
@@ -114,7 +114,7 @@ async def test_refused_guild_is_named(caplog: pytest.LogCaptureFixture) -> None:
     client.tree.sync = refuse  # type: ignore[method-assign]
     with caplog.at_level(logging.ERROR):
         await client._sync_commands()
-    assert "1498911215865561122" in caplog.text
+    assert "900000000000000001" in caplog.text
 
 
 async def test_unexpected_sync_failure_still_surfaces(
