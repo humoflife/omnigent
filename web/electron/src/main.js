@@ -41,8 +41,10 @@ const {
   normalizeUrl,
   normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
+  normalizeSavedServerUrl,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
+  LOCAL_HOSTS,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
@@ -56,6 +58,12 @@ const { isDeveloperModeEnabled } = require("./developer_mode");
 const { excludingManagedServers, getManagedServerUrls } = require("./managed_preferences");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const {
+  SETTINGS_PATH,
+  focusedConnectedWindow,
+  macApplicationMenu,
+  settingsMenuItem,
+} = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -64,6 +72,67 @@ const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
 
 /** The setup page's file:// URL, for verifying IPC sender frames. */
 const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
+
+/** The gated server selector (built by web's `build:server-selector-v2`). */
+const SERVER_SELECTOR_V2_PAGE = path.join(
+  __dirname,
+  "..",
+  "server-selector-v2",
+  "server-selector-v2.html",
+);
+const SERVER_SELECTOR_V2_PAGE_URL = pathToFileURL(SERVER_SELECTOR_V2_PAGE);
+
+/** True when OMNIGENT_SERVER_SELECTOR_V2 forces the wizard on (CI/dev override). */
+function serverSelectorV2EnvForced() {
+  return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
+}
+
+/**
+ * Whether to show the React server selector instead of the classic static
+ * setup page. The env var forces it on (dev/CI); otherwise it's the persisted
+ * View → Experiments toggle (settings.json `server_selector_v2`). Default: off.
+ */
+function serverSelectorV2Enabled() {
+  return serverSelectorV2EnvForced() || loadSettings().server_selector_v2 === true;
+}
+
+/** Which setup page to load — the server selector when enabled. */
+function setupPagePath() {
+  return serverSelectorV2Enabled() ? SERVER_SELECTOR_V2_PAGE : SETUP_PAGE;
+}
+
+/**
+ * The wizard's Vite dev-server URL, used only in an unpackaged build with the
+ * wizard enabled. Defaults to the fixed port the `dev:server-selector-v2` script
+ * pins (see web/vite.server-selector-v2.config.ts);
+ * OMNIGENT_SERVER_SELECTOR_V2_DEV_URL overrides it. Null when not applicable, so
+ * a packaged build always loads the file://.
+ */
+function serverSelectorV2DevUrl() {
+  if (app.isPackaged || !serverSelectorV2Enabled()) return null;
+  return (
+    process.env.OMNIGENT_SERVER_SELECTOR_V2_DEV_URL ||
+    "http://localhost:5174/server-selector-v2.html"
+  );
+}
+
+/**
+ * Load the setup page (or server selector) into `win`, appending `search`
+ * (a query string without the leading "?", or empty).
+ *
+ * In dev with the wizard flag on, try the Vite dev server over http (so the
+ * wizard gets HMR — it still runs in this window, keeping the omnigentSetup
+ * bridge). If that server isn't running, loadURL rejects and we fall back to
+ * the bundled file:// page. Prod always loads file://. Returns the load promise.
+ */
+function loadSetupPage(win, search = "") {
+  const loadFile = () => win.loadFile(setupPagePath(), search ? { search } : undefined);
+  const devUrl = serverSelectorV2DevUrl();
+  if (devUrl) {
+    return win.loadURL(search ? `${devUrl}?${search}` : devUrl).catch(loadFile);
+  }
+  return loadFile();
+}
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
@@ -1117,7 +1186,7 @@ function registerNavigationFallbacks(win) {
       });
       if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
       pinWindow(win, null); // back on the setup page → no trusted origin
-      void win.loadFile(SETUP_PAGE, { search: params.toString() });
+      void loadSetupPage(win, params.toString());
     },
   );
 
@@ -1139,7 +1208,7 @@ function registerNavigationFallbacks(win) {
     });
     if (state.ephemeral) params.set("ephemeral", "1");
     pinWindow(win, null);
-    void win.loadFile(SETUP_PAGE, { search: params.toString() });
+    void loadSetupPage(win, params.toString());
   });
 }
 
@@ -1218,7 +1287,8 @@ function createWindow(targetUrl, opts = {}) {
   });
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
-  const saved = loadSettings().server_url;
+  // CLI config stores the API mount; Electron boots the browser-facing SPA.
+  const saved = normalizeSavedServerUrl(loadSettings().server_url);
   // serverUrl: the window's server IDENTITY for host/server CLI commands
   // (``omnigent host --server``, ``omnigent login``, ``serverAuthed``) — the
   // origin or origin+mount, WITHOUT the conversation path. Prefer an explicit
@@ -1305,7 +1375,7 @@ function createWindow(targetUrl, opts = {}) {
       search.set("error", "saved server URL in settings.json is not a valid URL");
       search.set("url", serverUrl);
     }
-    void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
+    void loadSetupPage(win, search.toString());
   }
 
   // Page-initiated window.open / target=_blank: web links open in the
@@ -1905,7 +1975,7 @@ function changeServer() {
   }
   if (win) {
     pinWindow(win, null); // back on the setup page → no trusted origin
-    void win.loadFile(SETUP_PAGE, ephemeral ? { search: "ephemeral=1" } : undefined);
+    void loadSetupPage(win, ephemeral ? "ephemeral=1" : "");
   }
 }
 
@@ -1919,18 +1989,23 @@ function changeServer() {
 
 function buildMenu() {
   const isMac = process.platform === "darwin";
+  const settingsItem = settingsMenuItem(() => {
+    const target = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
+    sendOpenPath(target, SETTINGS_PATH);
+  });
 
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const template = [];
 
-  // macOS app menu (About/Services/Hide/Quit), named "Omnigent" via the
-  // app name set below. Non-mac platforms have no app menu.
+  // Settings belongs in the macOS app menu. Keep the standard app roles that
+  // Electron's composite appMenu role would otherwise provide.
   if (isMac) {
-    template.push({ role: "appMenu" });
+    template.push(macApplicationMenu(app.name, settingsItem));
   }
 
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const serverSubmenu = [
+    ...(!isMac ? [settingsItem, { type: "separator" }] : []),
     {
       id: "new_session",
       label: "New Session",
@@ -1940,6 +2015,7 @@ function buildMenu() {
     {
       id: "new_window",
       label: "New Window",
+      accelerator: "CmdOrCtrl+Shift+N",
       click: () => newWindow(),
     },
     {
@@ -2050,6 +2126,9 @@ function buildMenu() {
   });
   // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
   // the opt-in Debug menu, so this menu is identical in normal releases.
+  // (The server-selector-v2 toggle lives in the setup pages themselves — the
+  // classic page's CLI modal and the V2 page's cog menu — via the
+  // omnigent:set-server-selector-v2 IPC, not here.)
   template.push({
     label: "View",
     submenu: [
@@ -2148,7 +2227,27 @@ function isSetupPageSender(event) {
   } catch {
     return false;
   }
-  return url.protocol === "file:" && url.pathname === SETUP_PAGE_URL.pathname;
+  // Compare by origin+pathname, ignoring the query — the setup page is loaded
+  // with ?error=…/?url=…/?ephemeral=1 variants, so a full-string match would
+  // reject those frames.
+  //
+  // Dev only: the wizard served over http by its Vite dev server (see
+  // loadSetupPage / serverSelectorV2DevUrl). The helper is null in a packaged
+  // build, so this can never trust an http origin in prod.
+  const devUrl = serverSelectorV2DevUrl();
+  if (devUrl) {
+    try {
+      const dev = new URL(devUrl);
+      if (url.origin === dev.origin && url.pathname === dev.pathname) return true;
+    } catch {
+      // Malformed dev URL — fall through to the file:// check.
+    }
+  }
+  return (
+    url.protocol === "file:" &&
+    (url.pathname === SETUP_PAGE_URL.pathname ||
+      url.pathname === SERVER_SELECTOR_V2_PAGE_URL.pathname)
+  );
 }
 
 /**
@@ -2217,6 +2316,11 @@ function createBrowserRegistryForWindow(win) {
         return 1;
       }
     },
+    copyTextToClipboard: (text) => clipboard.writeText(text),
+    openUrlExternal: (url) => void shell.openExternal(url),
+    showContextMenu: (items) => {
+      Menu.buildFromTemplate(items).popup({ window: win });
+    },
   });
 }
 
@@ -2237,7 +2341,7 @@ function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
-  ipcMain.handle("omnigent:set-server-url", async (event, url) => {
+  ipcMain.handle("omnigent:set-server-url", async (event, url, opts) => {
     if (!isSetupPageSender(event)) {
       // A server page must never be able to re-point which server is saved.
       throw new Error("set-server-url is only available to the setup page");
@@ -2248,6 +2352,28 @@ function registerIpc() {
     const managedTarget = managedServerUrls().find((candidate) => candidate === url);
     const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
     const target = await expandDatabricksWorkspaceUrl(normalized);
+
+    // Guard against navigating to (and pinning as trusted) a non-Omnigent site
+    // the user typed by mistake. Managed choices are pre-validated; local hosts
+    // are the user's own machine — both skip the check. For a remote URL we
+    // probe the well-known manifest; if it doesn't look like an Omnigent server
+    // and the user hasn't confirmed, ask the page to warn before proceeding.
+    // Soft (not a hard block): older Omnigent servers predate the manifest, so
+    // a second click must still let them through. force skips the re-probe.
+    //
+    // ONLY when the server selector is active: the classic static setup page
+    // calls setServerUrl(url) with no opts and can't handle a {needsConfirm}
+    // reply (it just expects navigation), so guarding it there would silently
+    // swallow the connect. The server selector is the only caller that
+    // understands the confirm handshake.
+    const isLocal = LOCAL_HOSTS.has(new URL(target).hostname);
+    if (serverSelectorV2Enabled() && !managedTarget && !isLocal && !opts?.force) {
+      const manifest = await fetchServerManifest(target);
+      if (manifest.manifestVersion < 1) {
+        return { needsConfirm: true, url: target };
+      }
+    }
+
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     // Multi-server windows connect without touching the saved server —
     // the connection lives and dies with the window.
@@ -2309,6 +2435,66 @@ function registerIpc() {
     }
     const managed = managedServerUrls();
     return excludingManagedServers(normalizeRecentServers(loadSettings().recent_servers), managed);
+  });
+
+  // Setup page → drop one recent server from settings.json. Returns the
+  // remaining recents (managed-excluded), matching get-recent-servers, so the
+  // page can reconcile its list.
+  ipcMain.handle("omnigent:forget-recent-server", (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("forget-recent-server is only available to the setup page");
+    }
+    const managed = managedServerUrls();
+    const settings = loadSettings();
+    const remaining = normalizeRecentServers(settings.recent_servers).filter((u) => u !== url);
+    settings.recent_servers = remaining;
+    saveSettings(settings);
+    return excludingManagedServers(remaining, managed);
+  });
+
+  // Setup page → reachability/validity probe for a server the user just added.
+  // Advisory only (never gates Join): resolves one of
+  //   "ok"        — responded and looks like an Omnigent server (has the manifest)
+  //   "reachable" — responded, but the manifest is absent (old/unknown server)
+  //   "unreachable" — no response (network error / timeout / bad URL)
+  ipcMain.handle("omnigent:check-server", async (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("check-server is only available to the setup page");
+    }
+    let origin;
+    try {
+      origin = new URL(normalizeUrl(url)).origin;
+    } catch {
+      return { status: "unreachable" };
+    }
+    // Manifest present → definitively an Omnigent server.
+    const manifest = await fetchServerManifest(origin);
+    if (manifest.manifestVersion >= 1) return { status: "ok" };
+    // No manifest: distinguish "host answered" from "nothing there" with a
+    // liveness fetch (any HTTP response counts as reachable). Short timeout;
+    // a 4xx/5xx still means something is listening.
+    try {
+      await fetch(origin, { redirect: "manual", signal: AbortSignal.timeout(3000) });
+      return { status: "reachable" };
+    } catch {
+      return { status: "unreachable" };
+    }
+  });
+
+  // Setup page → toggle the revamped server selector (settings.server_selector_v2)
+  // and reload the sending window to the chosen page. Both setup pages drive
+  // this: the classic page's CLI modal switches TO the new one, the V2 page's
+  // cog menu switches back. No-op when the env var forces the choice.
+  ipcMain.handle("omnigent:set-server-selector-v2", (event, enabled) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("set-server-selector-v2 is only available to the setup page");
+    }
+    if (serverSelectorV2EnvForced()) return; // env wins; can't be toggled off
+    const settings = loadSettings();
+    settings.server_selector_v2 = enabled === true;
+    saveSettings(settings);
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) void loadSetupPage(win);
   });
 
   // Setup page → organization-provided server choices from macOS Managed
@@ -2415,7 +2601,7 @@ function registerIpc() {
     const ephemeral = windows.get(win)?.ephemeral === true;
     pinWindow(win, null); // back on the setup page → no trusted origin
     setWindowServerUrl(win, null);
-    void win.loadFile(SETUP_PAGE, ephemeral ? { search: "ephemeral=1" } : undefined);
+    void loadSetupPage(win, ephemeral ? "ephemeral=1" : "");
   });
 
   // Find bar → run/continue a search in its parent window. Empty text
@@ -2798,20 +2984,17 @@ function focusAndRestore(win) {
 }
 
 /**
- * Tell a pinned window's SPA to navigate in-place to an in-app path
- * (`/c/<id>`), without a reload — reuses the SPA's router, the same path a
- * notification click routes (basename-less; the embedded build's
- * `basenamedRouting` rebases it under the mount). Main→renderer only; the page
- * cannot invoke it. The caller (reuse-inplace) only sends when the window's
- * top-level page IS the pinned server (SPA listener mounted); this is
- * defense-in-depth on top of that.
+ * Tell a pinned window's SPA to navigate in-place to a basename-less app path
+ * (`/c/<id>`, `/settings`), without a reload. The embedded build's
+ * `basenamedRouting` rebases it under the mount. Main→renderer only; the page
+ * cannot invoke it. Callers send only while the pinned app is visible.
  *
  * @param {BrowserWindow | null | undefined} win
  * @param {string} routePath
  */
 function sendOpenPath(win, routePath) {
   if (!win || win.isDestroyed()) return;
-  console.log(`[omnigent] deep-link: send open-path ${routePath}`);
+  console.log(`[omnigent] send open-path ${routePath}`);
   try {
     win.webContents.send("omnigent:open-path", routePath);
   } catch {
