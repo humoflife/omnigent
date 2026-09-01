@@ -1299,6 +1299,30 @@ def _default_artifact_location() -> str:
     return str(_local_data_dir() / "artifacts")
 
 
+def _display_db_uri(db_uri: str) -> str:
+    """Render a DB URI for display with any embedded credential masked.
+
+    The server banner and maintenance reports reach container logs, log
+    shippers, and support bundles, so a password-bearing URL must not be
+    echoed verbatim — even when the operator kept it out of ``ps`` by
+    passing it via the environment.
+
+    :param db_uri: The resolved store DB URI, e.g.
+        ``"postgresql://omnigent:pw@db:5432/omnigent"``.
+    :returns: The URI with the password replaced by ``***``, or the
+        original string when it is not a parseable SQLAlchemy URL.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    try:
+        return make_url(db_uri).render_as_string(hide_password=True)
+    except ArgumentError:
+        # A malformed URI is surfaced by the engine on connect; display
+        # keeps whatever the operator provided rather than failing here.
+        return db_uri
+
+
 def _ensure_sqlite_parent_dir(db_uri: str) -> None:
     """Create the parent directory of a SQLite DB file if it's missing.
 
@@ -2143,13 +2167,13 @@ def main() -> None:
     if log_to_stderr:
         os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
 
-    # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
-    # interactive terminal: ``run`` resolves the configured default agent /
-    # first-run plan and drops into ``setup`` when nothing is configured. In
-    # a non-interactive context (pipe, CI, no TTY) fall back to ``--help`` so
-    # we never launch a REPL that would hang waiting on stdin.
+    # Bare ``omnigent`` with no args behaves like ``omnigent start`` on an
+    # interactive terminal: bring up the local server / host in the background
+    # and return, rather than dropping into an agent REPL. In a non-interactive
+    # context (pipe, CI, no TTY) fall back to ``--help`` so we never block on a
+    # sign-in prompt. Use ``omnigent run`` to launch the default agent.
     if not argv:
-        argv = ["run"] if sys.stdin.isatty() else ["--help"]
+        argv = ["start"] if sys.stdin.isatty() else ["--help"]
 
     # Shorthand: ``omnigent --harness claude [opts]`` →
     # ``run --harness claude [opts]``. Click group-level options are
@@ -3195,7 +3219,10 @@ def _load_or_create_host_id() -> str | None:
 
     try:
         return load_or_create_host_identity(CONFIG_PATH).host_id
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: identity file unwritable. ValueError: a malformed persisted /
+        # env host_id — a foreground host has nothing to key on, so degrade to
+        # None; the loud fail-fast is on the `omnigent host` connect path.
         return None
 
 
@@ -3286,6 +3313,17 @@ def _build_host_daemon_env(
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key.startswith(daemon_env_prefixes)
         }
+    # The daemon outlives the dispatch that spawned it and is reused by later
+    # invocations, so a dispatch-scoped caller trace context must not stick to
+    # it — a reused daemon would funnel every later run into the first
+    # caller's (long-dead) trace.
+    from omnigent.runtime.telemetry import (
+        DISPATCH_TRACEPARENT_ENV_VAR,
+        DISPATCH_TRACESTATE_ENV_VAR,
+    )
+
+    env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
+    env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
     return env
 
 
@@ -3330,10 +3368,11 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     today. A non-200 answer that carries the Databricks edge signature
     (302 to the workspace OAuth page, or a DatabricksRealm 401) means
     the run would otherwise die much later with an opaque "non-JSON
-    response (status=302)" traceback from the session-create call. First,
-    it asks the SDK for a fresh workspace token; only then does a TTY run
-    the same flow ``omnigent login`` would, while headless invocations get
-    the exact command to run instead.
+    response (status=302)" traceback from the session-create call. A
+    rejected bearer can hide that signature behind a bare 401/403, so the
+    probe falls back to the saved workspace or an unauthenticated retry.
+    It then asks the SDK for a fresh workspace token before prompting a
+    TTY or giving headless invocations the exact login command.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3353,14 +3392,15 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     import httpx as _httpx
 
     from omnigent.chat import _remote_headers
-    from omnigent.cli_auth import load_databricks_org_id, store_databricks_auth
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        load_databricks_workspace_host,
+        store_databricks_auth,
+    )
 
+    headers = _remote_headers(server_url=server, host_id=None)
     try:
-        probe = _httpx.get(
-            f"{server}/v1/me",
-            headers=_remote_headers(server_url=server, host_id=None),
-            timeout=10.0,
-        )
+        probe = _httpx.get(f"{server}/v1/me", headers=headers, timeout=10.0)
     except _httpx.HTTPError:
         # Unreachable / transient: let the connect path raise its own,
         # already-actionable error rather than failing the pre-flight.
@@ -3368,6 +3408,18 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     if probe.status_code == 200:
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
+    credential_rejected = False
+    if workspace_host is None and probe.status_code in (401, 403):
+        # A rejected bearer can hide the edge signature. Prefer the saved
+        # workspace; otherwise re-probe without credentials.
+        workspace_host = load_databricks_workspace_host(server)
+        if workspace_host is None and "Authorization" in headers:
+            try:
+                unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+            except _httpx.HTTPError:
+                return
+            workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
+        credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
         return
     org_id = load_databricks_org_id(server)
@@ -3386,12 +3438,17 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     # `omnigent login` back to the same API base.
     display = ServerUrl(api_base=server, org_id=org_id).display
     login_cmd = f"omnigent login {display}"
+    state = (
+        f"Your Databricks credential for {display} has expired or was revoked"
+        if credential_rejected
+        else f"Not signed in to {display}"
+    )
     if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
-            f"Not signed in to {display} (Databricks-fronted; /v1/me answered "
+            f"{state} (Databricks-fronted; /v1/me answered "
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
-    click.echo(f"Not signed in to {display} — running `{login_cmd}` first.")
+    click.echo(f"{state} — running `{login_cmd}` first.")
     # Login selector comes from the URL, not the stored org_id used above: on a
     # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
     # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
@@ -4222,7 +4279,7 @@ def server(
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
-    click.echo(f"  database:  {db_uri}")
+    click.echo(f"  database:  {_display_db_uri(db_uri)}")
     click.echo(f"  artifacts: {art_loc}")
     click.echo(f"  log:       {_display_path(server_log_path)}")
 
@@ -5793,9 +5850,9 @@ def polly(run_args: tuple[str, ...]) -> None:
     # :param run_args: Pass-through args for ``run``.
     """Launch polly, the bundled multi-agent coding orchestrator.
 
-    Shorthand for ``omnigent run`` on the packaged polly agent — the same
-    agent a bare ``omnigent`` launches when a Claude credential is
-    configured. All ``run`` options are accepted and forwarded.
+    Shorthand for ``omnigent run`` on the packaged polly agent — the default
+    agent ``omnigent run`` launches when a Claude credential is configured.
+    All ``run`` options are accepted and forwarded.
 
     \b
     Examples:
@@ -6118,11 +6175,9 @@ def import_session_command(
             target = futures[future]
             results[target] = future.result()
 
-    # A network failure is fatal for the whole batch, matching the serial import.
-    unreachable = next((r for r in results.values() if r.status == "unreachable"), None)
-    if unreachable is not None:
-        raise click.ClickException(unreachable.message or "Could not reach the Omnigent server")
-
+    # A per-session network failure (e.g. one large session's read timeout) is
+    # reported and counted like any other failure so the rest of the batch still
+    # imports; only the single-session path treats unreachable as fatal.
     imported_count = 0
     already_imported_count = 0
     failed_count = 0
@@ -7908,6 +7963,16 @@ def run(
     # ambient DATABRICKS_CONFIG_PROFILE.
     if databricks_profile:
         os.environ["DATABRICKS_CONFIG_PROFILE"] = databricks_profile
+    # `run` is a one-shot dispatch on the invoking client's behalf: bless the
+    # ambient TRACEPARENT as this dispatch's caller trace context so the
+    # spawned server/runner/harness spans join the caller's trace. Only this
+    # deliberate capture propagates it — a long-lived server that merely
+    # inherited a wrapper's TRACEPARENT does not extract it. On the
+    # daemon-backed path the capture is inert: _build_host_daemon_env scrubs
+    # the dispatch vars, so those runs keep response-derived traces.
+    from omnigent.runtime.telemetry import capture_dispatch_trace_context
+
+    capture_dispatch_trace_context()
     # Rejected before anything is resolved: `run` never routed in-harness, and
     # its create-time route is gone.
     if smart_routing:
@@ -10516,9 +10581,23 @@ def setup(internal_beta: bool) -> None:
         )
         return
 
-    # --no-internal-beta: the standard model/credential picker. It warns
-    # about missing Node/tmux itself, configures providers/defaults, and
-    # returns; the user then starts a session with ``omnigent run``.
+    # --no-internal-beta: validate existing providers before entering the
+    # picker so malformed user config is reported as an actionable CLI error,
+    # not an application crash from the picker's ambient-adoption step.
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.onboarding.provider_config import load_providers
+
+    try:
+        load_providers(_load_global_config())
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        path = _display_config_path(_effective_global_config_path())
+        raise click.ClickException(f"Invalid provider configuration in {path}: {exc}") from None
+
+    # The picker warns about missing Node/tmux itself, configures
+    # providers/defaults, and returns; the user then starts a session with
+    # ``omnigent run``.
     _run_configure_harnesses_interactive()
 
 
@@ -10682,7 +10761,7 @@ def debug_migrate_accounts_to_oidc(
 
     mode = "COMMITTED" if report.committed else "DRY RUN (no changes written)"
     click.echo(f"\nIdentity remap — {mode}")
-    click.echo(f"  database: {url}")
+    click.echo(f"  database: {_display_db_uri(url)}")
     click.echo(f"  mappings ({len(report.mapping)}):")
     for old, new in report.mapping.items():
         click.echo(f"    {old}  ->  {new}")
@@ -11681,9 +11760,9 @@ def _remember_default_server(server: str) -> None:
     """
     Persist *server* as the user-level default after a successful login.
 
-    A bare ``omnigent`` (and ``omnigent host``) fall back to the
-    configured ``server`` key when no ``--server`` is passed (see
-    :func:`run` and :func:`host`). Without this, a user who runs
+    A bare ``omnigent`` (which starts the host) and ``omnigent host`` fall
+    back to the configured ``server`` key when no ``--server`` is passed (see
+    :func:`start` and :func:`host`). Without this, a user who runs
     ``omnigent login <server>`` and then bare ``omnigent`` is still routed
     at whatever default ``setup`` baked in — the confusing "I just logged
     in, yet I'm asked to log in again to a different server" path.
