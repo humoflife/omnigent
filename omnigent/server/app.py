@@ -744,16 +744,23 @@ def _ensure_default_acp_agents(
     agent_cache: Any,
 ) -> None:
     """
-    Seed a picker agent for each ACP harness set up on THIS server's host.
+    Seed a picker agent per builtin ACP CLI row and per configured ``acp:`` agent.
 
     Native harnesses seed a fixed ``<harness>-ui`` agent each
-    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
-    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
-    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
-    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
-    host with no ACP setup — the common remote-server case, where the server holds
-    no ``acp:`` config — this seeds nothing. When both sources name the same
-    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
+    (:func:`_ensure_default_native_agents`) unconditionally; the picker hides a row
+    the selected host cannot launch, reading that host's ``configured_harnesses``
+    readiness map. Builtin ACP CLI harnesses follow the same model, because the
+    vendor CLI runs on the *executing* host (the attached runner) rather than on the
+    server: gating the row on the server's own PATH left Devin and Grok missing from
+    the picker on every remote server, even when the runner had them installed.
+
+    User-configured ``acp:<slug>`` agents stay config-gated. Their launch command is
+    resolved from the *host's* own ``acp:`` block at spawn time, so a row naming a
+    slug the executing host does not define could never launch; surfacing those on a
+    remote server first needs the host to advertise its configured slugs.
+
+    When both sources name the same harness, the configured agent wins (see
+    :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
     A malformed ``acp:`` block is logged and skipped, never fatal to startup
@@ -767,7 +774,6 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
@@ -793,12 +799,12 @@ def _ensure_default_acp_agents(
             bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
         )
 
-    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
-    # by the catalog id (already a valid slug), not the display label. A row a
-    # configured agent already claims is skipped: both seed the same
-    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
-    for key, row in ACP_CLI_HARNESSES.items():
-        if key in shadowed or resolve_cli_binary(row.binary) is None:
+    # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
+    # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
+    # (already a valid slug), not the display label. A row a configured agent already
+    # claims is skipped: both seed the same ``builtin_agent_id``.
+    for key in ACP_CLI_HARNESSES:
+        if key in shadowed:
             continue
         _ensure_builtin_agent(
             agent_store,
@@ -2291,6 +2297,7 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            project_store=project_store,
             host_registry=host_registry,
             host_store=host_store,
         ),
@@ -2614,9 +2621,13 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        from omnigent.server.routes._sessions.common import (
+            _session_sandbox_status_cache,
+        )
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
 
@@ -2711,6 +2722,14 @@ def create_app(
             await _publish_runner_recovered_status(
                 conv.id, conversation_store, require_disconnect_code=True
             )
+            # A managed launch that outlived its connect timeout cached
+            # sandbox_status "failed"; this runner connecting proves the
+            # sandbox is live, so drop the stale banner. Only "failed" is
+            # cleared -- an in-flight launch (provisioning/connecting) must
+            # not be short-circuited by an older runner reconnecting.
+            cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+            if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                _publish_sandbox_status(conv.id, "ready")
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
