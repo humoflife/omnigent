@@ -126,6 +126,11 @@ launch under a tool that injects a `.env` — e.g.
 `uv run --env-file .env omni integration discord`. In production the container
 deploy sets them directly. `.env.example` documents the full set.
 
+> `--env-file` fills in only what the environment does not already define: an
+> exported `OMNIGENT_DISCORD_BOT_TOKEN` silently wins over the file's value. If
+> the bot fails with `Improper token has been passed` while the file looks
+> right, check `env | grep OMNIGENT_DISCORD` and `unset` the stale one.
+
 The bot lives in the separate `omnigent-discord` package, which must be installed
 **in the same environment as** `omni` for the `omni integration discord` commands
 to find it. Install it as the `discord` extra of omnigent:
