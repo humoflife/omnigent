@@ -32,6 +32,7 @@ from typing import Any
 OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     # Setup / validation.
     ("GET", "/health", True),
+    ("GET", "/v1/info", True),
     ("GET", "/v1/me", True),
     ("GET", "/v1/agents", True),
     ("GET", "/v1/hosts", True),

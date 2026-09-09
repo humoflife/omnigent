@@ -50,8 +50,8 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
@@ -120,7 +120,10 @@ _TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # exceed the old 240s cap, tripping the watchdog and wedging the session
 # in a "Prompt is too long" → compaction → 240s-timeout loop.
 # Env var name kept for the ops knob; ``<= 0`` disables.
-_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
+_DEFAULT_TURN_IDLE_TIMEOUT_S = 3600.0
+_TURN_IDLE_TIMEOUT_S = float(
+    os.environ.get("HARNESS_TURN_TIMEOUT_S", _DEFAULT_TURN_IDLE_TIMEOUT_S)
+)
 
 # Absolute per-turn ceiling on TOTAL turn duration. Progress-aware when
 # the idle watchdog is enabled: every real progress event extends the
