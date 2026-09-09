@@ -225,6 +225,9 @@ class FakeOmnigent:
         self.latest_after_turn: tuple[str | None, str] | None = None
         self._turns = 0
         self.created: list[tuple[str, str]] = []
+        # host_type of each create_session call, so a test can assert a managed
+        # session asks the server to provision its own host.
+        self.created_host_types: list[str] = []
         self.launched: list[dict[str, Any]] = []
         self.submitted: list[str] = []
         self.resolved: list[dict[str, Any]] = []
@@ -238,10 +241,13 @@ class FakeOmnigent:
         # channel reservation to be held rather than racing the scheduler.
         self.turn_started = asyncio.Event()
 
-    async def create_session(self, agent_id: str, title: str) -> str:
+    async def create_session(
+        self, agent_id: str, title: str, *, host_type: str = "external"
+    ) -> str:
         if self.create_error is not None:
             raise self.create_error
         self.created.append((agent_id, title))
+        self.created_host_types.append(host_type)
         return self.session_id
 
     async def launch_runner(

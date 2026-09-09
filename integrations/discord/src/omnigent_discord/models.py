@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent_bot_core.events import HostType
+
 
 @dataclass(frozen=True, slots=True)
 class ChannelKey:
@@ -44,6 +46,10 @@ class UserConfig:
     The Omnigent server is operator-fixed (``OMNIGENT_SERVER_URL``), so it is
     not part of a user's config. Stored per Discord user id — the snowflake is
     global, so one setup covers every guild and DM the bot shares with them.
+
+    ``host_type`` picks between the two ways a session gets a host. It is
+    ``"managed"`` when the user chose a server-provisioned sandbox, and then
+    ``host_id`` and ``workspace`` are empty — the server chooses both.
     """
 
     agent_id: str
@@ -51,16 +57,23 @@ class UserConfig:
     workspace: str
     host_id: str | None = None
     host_name: str | None = None
+    host_type: HostType = "external"
 
 
 @dataclass(frozen=True, slots=True)
 class SessionRecord:
-    """A Discord channel's Omnigent session and where it runs."""
+    """A Discord channel's Omnigent session and where it runs.
+
+    ``host_type`` is recorded per session, not just per user: it decides whether
+    a later turn in this channel may launch a runner, and it must survive both a
+    bot restart and the user changing their setup mid-conversation.
+    """
 
     session_id: str
     owner_user_id: str | None
     host_id: str | None
     workspace: str | None
+    host_type: HostType = "external"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,3 +95,4 @@ class DiscordTurn:
     owner_user_id: str
     workspace: str | None = None
     host_id: str | None = None
+    host_type: HostType = "external"

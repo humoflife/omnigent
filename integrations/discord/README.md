@@ -150,13 +150,19 @@ the bot updates in place:
 1. It validates connectivity to `OMNIGENT_SERVER_URL`. If the server has
    authentication enabled, the message shows a sign-in link and **updates itself
    automatically** once the user approves it in their browser (see
-   **Authentication** below). If no host is online, it shows how to start one
-   instead of continuing — a session needs a host to run on.
+   **Authentication** below). If nothing can run a session — no host of the
+   user's is online *and* the server provisions no managed sandbox — it shows how
+   to start a host instead of continuing.
 2. Pick the **agent** and **host** from menus populated by the server, then press
-   **Save workspace** to enter the **workspace path** — an absolute directory on
-   the host where each session's runner starts. It defaults to the selected
-   host's home directory, falling back to the bot's working directory only if the
-   host can't be probed.
+   **Save**. The host menu lists the user's own online hosts, and — when the
+   server reports `managed_sandboxes_enabled` — a **Managed sandbox** entry at
+   the top, so someone who runs no host of their own still has a usable choice.
+3. Choosing one of your own hosts prompts for the **workspace path** — an
+   absolute directory on that host where each session's runner starts. It
+   defaults to the host's home directory, falling back to the bot's working
+   directory only if the host can't be probed. Choosing the managed sandbox skips
+   this: the server creates the sandbox and its working directory, so there is no
+   path to supply.
 
 The choice is saved per Discord user. Discord user ids are global, so **one setup
 covers every server and DM** the bot shares with that person — no need to

@@ -21,6 +21,7 @@ from omnigent_bot_core.omnigent import (
 )
 from omnigent_discord.models import UserConfig
 from omnigent_discord.setup import (
+    MANAGED_HOST_VALUE,
     SetupFlow,
     agent_options,
     default_workspace,
@@ -37,6 +38,21 @@ SERVER = "https://omnigent.example.com"
 LOGGER = logging.getLogger("test")
 AGENTS = [{"id": "ag_1", "name": "debby"}]
 HOSTS = [{"host_id": "h1", "name": "Host One", "status": "online"}]
+
+
+def _probed(
+    hosts: list[dict[str, Any]],
+    *,
+    managed_hosts: bool = False,
+    provider: str | None = None,
+) -> ValidatedServer:
+    """A server-probe result carrying ``hosts`` and the managed capability."""
+    return ValidatedServer(
+        agents=AGENTS,
+        online_hosts=hosts,
+        managed_hosts=managed_hosts,
+        managed_host_provider=provider,
+    )
 
 
 # ── fakes ─────────────────────────────────────────────────────────────────
@@ -103,16 +119,25 @@ class FakeSetupClient:
         hosts: list[dict[str, Any]] | None = None,
         error: Exception | None = None,
         host_home: str | None = "/home/bot",
+        managed_hosts: bool = False,
+        managed_host_provider: str | None = None,
     ) -> None:
         self.agents = AGENTS if agents is None else agents
         self.hosts = HOSTS if hosts is None else hosts
         self.error = error
         self.host_home = host_home
+        self.managed_hosts = managed_hosts
+        self.managed_host_provider = managed_host_provider
 
     async def validate(self) -> ValidatedServer:
         if self.error is not None:
             raise self.error
-        return ValidatedServer(agents=self.agents, online_hosts=self.hosts)
+        return ValidatedServer(
+            agents=self.agents,
+            online_hosts=self.hosts,
+            managed_hosts=self.managed_hosts,
+            managed_host_provider=self.managed_host_provider,
+        )
 
     async def get_host_home(self, host_id: str) -> str | None:
         return self.host_home
@@ -203,12 +228,36 @@ def test_agent_options_fit_discords_option_cap() -> None:
 
 
 def test_host_options_read_either_id_key() -> None:
-    assert host_options([{"id": "h9", "name": "Nine"}]) == [("Nine", "h9")]
-    assert host_options(HOSTS) == [("Host One", "h1")]
+    assert host_options(_probed([{"id": "h9", "name": "Nine"}])) == [("Nine", "h9")]
+    assert host_options(_probed(HOSTS)) == [("Host One", "h1")]
 
 
 def test_host_without_a_name_falls_back_to_its_id() -> None:
-    assert host_options([{"host_id": "h1"}]) == [("h1", "h1")]
+    assert host_options(_probed([{"host_id": "h1"}])) == [("h1", "h1")]
+
+
+def test_managed_sandbox_leads_the_host_options_when_the_server_offers_one() -> None:
+    """The managed entry sits first so a user with nothing online sees it."""
+    options = host_options(_probed(HOSTS, managed_hosts=True, provider="modal"))
+    assert options == [("Managed sandbox (modal)", MANAGED_HOST_VALUE), ("Host One", "h1")]
+
+
+def test_managed_sandbox_is_unlabeled_when_the_server_names_no_provider() -> None:
+    options = host_options(_probed([], managed_hosts=True))
+    assert options == [("Managed sandbox", MANAGED_HOST_VALUE)]
+
+
+def test_managed_entry_counts_against_the_option_cap() -> None:
+    """The managed entry takes a slot, so the host slice shrinks to fit."""
+    many = [{"host_id": f"h{i}", "name": f"host {i}"} for i in range(100)]
+    options = host_options(_probed(many, managed_hosts=True))
+    assert len(options) == MAX_SELECT_OPTIONS
+    assert options[0][1] == MANAGED_HOST_VALUE
+
+
+def test_no_managed_option_when_the_server_cannot_provision_one() -> None:
+    """An option that would only 422 is worse than no option."""
+    assert all(value != MANAGED_HOST_VALUE for _, value in host_options(_probed(HOSTS)))
 
 
 def test_no_host_guidance_names_the_command_and_the_server() -> None:
@@ -257,7 +306,7 @@ async def test_workspace_defaults_to_the_hosts_home(store: SQLiteStore) -> None:
     interaction = FakeInteraction()
     await _flow(store, FakeSetupClient(host_home="/home/runner")).run_config(interaction)
     save_button = interaction.last_view.children[-1]
-    assert save_button.label == "Save workspace"
+    assert save_button.label == "Save"
     assert interaction.last_view._workspace_default == "/home/runner"
 
 
@@ -290,6 +339,68 @@ async def test_no_online_host_shows_how_to_start_one(store: SQLiteStore) -> None
     interaction = FakeInteraction()
     await _flow(store, FakeSetupClient(hosts=[])).run_config(interaction)
     assert interaction.shows(f"omni host --server {SERVER}")
+
+
+async def test_setup_offers_a_managed_sandbox_instead_of_dead_ending(
+    store: SQLiteStore,
+) -> None:
+    """With no host of their own, a user gets the sandbox rather than a wall."""
+    interaction = FakeInteraction()
+    client = FakeSetupClient(hosts=[], managed_hosts=True, managed_host_provider="modal")
+    await _flow(store, client).run_config(interaction)
+
+    assert not interaction.shows(f"omni host --server {SERVER}")
+    host_select = next(
+        item
+        for item in interaction.last_view.children
+        if getattr(item, "placeholder", None) == "Choose a host"
+    )
+    assert [option.value for option in host_select.options] == [MANAGED_HOST_VALUE]
+
+
+async def test_workspace_is_left_blank_with_no_host_to_seed_it_from(
+    store: SQLiteStore,
+) -> None:
+    """The bot's cwd names nothing a server-side sandbox can reach."""
+    interaction = FakeInteraction()
+    client = FakeSetupClient(hosts=[], managed_hosts=True)
+    await _flow(store, client).run_config(interaction)
+    assert interaction.last_view._workspace_default == ""
+
+
+async def test_managed_choice_saves_straight_from_the_button(store: SQLiteStore) -> None:
+    """The server creates the sandbox's directory, so no path modal opens."""
+    interaction = FakeInteraction()
+    client = FakeSetupClient(hosts=[], managed_hosts=True, managed_host_provider="modal")
+    await _flow(store, client).run_config(interaction)
+    view = interaction.last_view
+    view._agent = ("debby", "ag_1")
+    view._host = ("Managed sandbox (modal)", MANAGED_HOST_VALUE)
+
+    save = FakeInteraction()
+    await view._on_save(save)
+
+    assert save.response.modals == []
+    saved = await store.get_user_config("1001")
+    assert saved is not None
+    assert saved.host_type == "managed"
+    assert saved.workspace == ""
+    assert saved.host_id is None
+
+
+async def test_a_real_host_still_opens_the_workspace_modal(store: SQLiteStore) -> None:
+    """An external host needs an absolute path to start its runner in."""
+    interaction = FakeInteraction()
+    await _flow(store, FakeSetupClient()).run_config(interaction)
+    view = interaction.last_view
+    view._agent = ("debby", "ag_1")
+    view._host = ("Host One", "h1")
+
+    save = FakeInteraction()
+    await view._on_save(save)
+
+    assert len(save.response.modals) == 1
+    assert await store.get_user_config("1001") is None
 
 
 async def test_unreachable_server_says_to_check_the_url_and_port(

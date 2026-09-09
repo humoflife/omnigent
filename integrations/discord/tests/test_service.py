@@ -799,3 +799,63 @@ async def test_another_bots_managed_role_is_not_an_address_to_this_bot(
         )
     )
     assert harness.client.submitted == []
+
+
+async def test_managed_session_skips_the_runner_launch(harness: Harness) -> None:
+    """A managed session's host is the server's to provision, not ours.
+
+    Launching a runner would need a host id the user does not have, and the
+    server already queues the first message until the sandbox is ready.
+    """
+    await harness.store.upsert_user_config(
+        str(OWNER.id),
+        UserConfig(
+            agent_id="ag_1",
+            agent_name="debby",
+            workspace="",
+            host_id=None,
+            host_name=None,
+            host_type="managed",
+        ),
+    )
+    await harness.deliver(dm("hello"))
+
+    assert harness.client.created_host_types == ["managed"]
+    assert harness.client.launched == []
+    assert harness.client.submitted == ["hello"]
+
+
+async def test_external_session_still_launches_a_runner(harness: Harness) -> None:
+    """The default path is unchanged: the user's own host gets a runner."""
+    await harness.deliver(dm("hello"))
+
+    assert harness.client.created_host_types == ["external"]
+    assert [entry["host_id"] for entry in harness.client.launched] == ["h1"]
+
+
+async def test_a_managed_session_stays_managed_after_the_user_switches_setup(
+    harness: Harness,
+) -> None:
+    """host_type is read from the session, not the user's current config.
+
+    Re-running setup mid-conversation must not retarget a live session, or a
+    follow-up turn would try to launch a runner the managed session has no host
+    for.
+    """
+    await harness.store.upsert_session(
+        ChannelKey(channel_id="600"),
+        "sess_1",
+        "Title",
+        owner_user_id=str(OWNER.id),
+        host_type="managed",
+    )
+    # The user has since switched back to their own host.
+    await harness.store.upsert_user_config(
+        str(OWNER.id),
+        UserConfig(agent_id="ag_1", agent_name="debby", workspace="/srv/work", host_id="h1"),
+    )
+
+    await harness.deliver(dm("carry on"))
+
+    assert harness.client.launched == []
+    assert harness.client.submitted == ["carry on"]

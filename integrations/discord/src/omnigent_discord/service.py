@@ -585,6 +585,10 @@ class DiscordOmnigentService:
                         owner_user_id=record.owner_user_id or requester,
                         workspace=record.workspace,
                         host_id=record.host_id,
+                        # From the SESSION, not the user's current config: a
+                        # conversation keeps running where it was created even
+                        # if the user re-runs setup and switches host type.
+                        host_type=record.host_type,
                     )
                 )
                 spawned = True
@@ -612,6 +616,7 @@ class DiscordOmnigentService:
                     owner_user_id=requester,
                     workspace=config.workspace,
                     host_id=config.host_id,
+                    host_type=config.host_type,
                 )
             )
             spawned = True
@@ -765,10 +770,23 @@ class DiscordOmnigentService:
             return None
 
         try:
-            session_id = await omnigent.create_session(turn.agent_id, turn.title)
-            runner_id = await omnigent.launch_runner(
-                session_id, workspace=turn.workspace or "", host_id=turn.host_id
+            session_id = await omnigent.create_session(
+                turn.agent_id, turn.title, host_type=turn.host_type
             )
+            runner_id: str | None = None
+            if turn.host_type == "managed":
+                # The server provisions this session's sandbox in the background,
+                # so there is no host to launch a runner on — and none is needed:
+                # the server holds the first message until the launch settles.
+                self._logger.info(
+                    "Managed session; the server provisions its host channel=%s session_id=%s",
+                    turn.key.display(),
+                    session_id,
+                )
+            else:
+                runner_id = await omnigent.launch_runner(
+                    session_id, workspace=turn.workspace or "", host_id=turn.host_id
+                )
         except AuthRequiredError as exc:
             # Expired/lost token: prompt a re-login rather than a plain notice.
             self._logger.info(
@@ -807,6 +825,7 @@ class DiscordOmnigentService:
             owner_user_id=turn.owner_user_id,
             host_id=turn.host_id,
             workspace=turn.workspace,
+            host_type=turn.host_type,
         )
         self._logger.info(
             "Mapped Discord channel to new Omnigent session channel=%s session_id=%s runner_id=%s",
@@ -862,7 +881,11 @@ class DiscordOmnigentService:
             # windows (a timeout must NOT cancel it — that would end the
             # generator); we re-await it next window.
             events = omnigent.run_turn(
-                session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
+                session_id,
+                turn.text,
+                workspace=turn.workspace,
+                host_id=turn.host_id,
+                host_type=turn.host_type,
             ).__aiter__()
             pending: asyncio.Task[dict[str, Any]] | None = None
             try:

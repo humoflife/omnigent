@@ -56,6 +56,18 @@ COMMAND_NAME = "omnigent"
 _logger = logging.getLogger(__name__)
 
 
+# ``value`` of the host select's managed-sandbox entry. Not a host id: the
+# server provisions the host when the session is created, so this marks "let the
+# server choose one" rather than naming a machine. Prefixed and underscored so it
+# can never collide with a real host id.
+MANAGED_HOST_VALUE = "__omnigent_managed__"
+
+
+def managed_host_label(provider: str | None) -> str:
+    """Select label for the server-provisioned sandbox, named by its provider."""
+    return f"Managed sandbox ({provider})" if provider else "Managed sandbox"
+
+
 def default_workspace() -> str:
     """Fallback default when the host's home directory can't be resolved.
 
@@ -186,19 +198,24 @@ def select_card(server_url: str) -> Card:
         title="Set up Omnigent",
         description=(
             f"Connected to **{server_url}**.\n"
-            "Pick an agent and a host, then choose **Save workspace** to finish."
+            "Pick an agent and a host, then choose **Save** to finish."
         ),
         color=COLOR_NEUTRAL,
     )
 
 
 def saved_card(config: UserConfig, server_url: str) -> Card:
-    host_line = f" on host **{config.host_name}**" if config.host_name else ""
+    if config.host_type == "managed":
+        # The server creates the sandbox and its working directory, so there is
+        # no host name or path of the user's to echo back.
+        where = " in a sandbox this server runs for you"
+    else:
+        host_line = f" on host **{config.host_name}**" if config.host_name else ""
+        where = f"{host_line}, rooted at `{config.workspace}`"
     return Card(
         title="✅ You're set up",
         description=(
-            f"I'll use **{config.agent_name}**{host_line} on {server_url}, "
-            f"rooted at `{config.workspace}`.\n"
+            f"I'll use **{config.agent_name}** on {server_url}{where}.\n"
             "Mention me in a channel or DM me to start a session."
         ),
         color=COLOR_POSITIVE,
@@ -240,10 +257,24 @@ def agent_options(agents: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return options
 
 
-def host_options(hosts: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """``(label, value)`` pairs for the host select, capped to Discord's limit."""
+def host_options(validated: ValidatedServer) -> list[tuple[str, str]]:
+    """``(label, value)`` pairs for the host select, capped to Discord's limit.
+
+    The managed sandbox is listed first so a user with nothing online still sees
+    a usable choice at the top, and is omitted entirely when the server can't
+    provision one — an option that would only 422 is worse than no option.
+    """
     options: list[tuple[str, str]] = []
-    for host in hosts[:MAX_SELECT_OPTIONS]:
+    if validated.managed_hosts:
+        options.append(
+            (
+                truncate_option(managed_host_label(validated.managed_host_provider)),
+                MANAGED_HOST_VALUE,
+            )
+        )
+    # The managed entry counts against Discord's option cap, so the host slice
+    # shrinks by what is already in the select.
+    for host in validated.online_hosts[: MAX_SELECT_OPTIONS - len(options)]:
         host_id = host_id_of(host)
         if host_id is None:
             continue
@@ -300,7 +331,7 @@ class _SelectionView(discord.ui.View):
             row=1,
         )
         self._host_select.callback = self._on_host  # type: ignore[method-assign]
-        save = discord.ui.Button(label="Save workspace", style=discord.ButtonStyle.success, row=2)
+        save = discord.ui.Button(label="Save", style=discord.ButtonStyle.success, row=2)
         save.callback = self._on_save  # type: ignore[method-assign]
         self.add_item(self._agent_select)
         self.add_item(self._host_select)
@@ -332,14 +363,31 @@ class _SelectionView(discord.ui.View):
             )
             return
         agent_name, agent_id = self._agent
-        host_name, host_id = self._host
+        host_name, host_value = self._host
+        if host_value == MANAGED_HOST_VALUE:
+            # The server creates the sandbox and its working directory, so there
+            # is no path to collect: save straight from the button rather than
+            # opening a modal that asks for one that means nothing.
+            await self._flow.save_config(
+                interaction,
+                self._user_id,
+                UserConfig(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    workspace="",
+                    host_id=None,
+                    host_name=None,
+                    host_type="managed",
+                ),
+            )
+            return
         await interaction.response.send_modal(
             _WorkspaceModal(
                 self._flow,
                 user_id=self._user_id,
                 agent_id=agent_id,
                 agent_name=agent_name,
-                host_id=host_id,
+                host_id=host_value,
                 host_name=host_name,
                 workspace_default=self._workspace_default,
             )
@@ -473,20 +521,27 @@ class SetupFlow:
         if not validated.agents:
             await self._show(interaction, no_agents_card(server_url))
             return
-        if not validated.online_hosts:
-            # A session needs a host to run on, so setup can't finish without
-            # one. Show the same guidance a turn does when no host is reachable.
+        if not validated.online_hosts and not validated.managed_hosts:
+            # Nothing can run a session: the user has no host of their own online
+            # and the server provisions none. Show the same guidance a turn does
+            # when no host is reachable. A server WITH managed sandboxes never
+            # reaches here — the select offers one instead of dead-ending.
             await self._show(interaction, no_host_card(server_url))
             return
         # Default the workspace to the host's home directory (where runners
         # actually run), not the bot process's cwd. Fall back to the bot's cwd
-        # only if the host can't be probed.
-        workspace_default = await self._resolve_default_workspace(omnigent, validated.online_hosts)
+        # only if the host can't be probed. With no host to probe, leave it
+        # blank — the bot's cwd names nothing a managed sandbox can use.
+        workspace_default = (
+            await self._resolve_default_workspace(omnigent, validated.online_hosts)
+            if validated.online_hosts
+            else ""
+        )
         view = _SelectionView(
             self,
             user_id=user_id,
             agents=agent_options(validated.agents),
-            hosts=host_options(validated.online_hosts),
+            hosts=host_options(validated),
             workspace_default=workspace_default,
         )
         await interaction.edit_original_response(
@@ -588,10 +643,11 @@ class SetupFlow:
         """Persist a completed setup and confirm it (modal-submit entry point)."""
         await self._store.upsert_user_config(user_id, config)
         self._logger.info(
-            "Saved Omnigent setup user=%s server=%s agent=%s host=%s",
+            "Saved Omnigent setup user=%s server=%s agent=%s host_type=%s host=%s",
             user_id,
             self._server_url,
             config.agent_id,
+            config.host_type,
             config.host_id,
         )
         await interaction.response.send_message(
