@@ -127,6 +127,15 @@ async def test_claim_event_prunes_entries_past_the_ttl(
     assert await store.claim_event("old") is True
 
 
+async def test_initialize_is_safe_to_run_twice(tmp_path: Path) -> None:
+    # The migration checks for its column, so a second start must not fail on
+    # a duplicate ALTER.
+    store = SQLiteStore(tmp_path / "bot.sqlite3")
+    await store.initialize()
+    await store.initialize()
+    assert await store.get_user_config("nobody") is None
+
+
 async def test_store_round_trips_managed_host_type(store: SQLiteStore) -> None:
     """A managed choice survives a write/read on both tables.
 

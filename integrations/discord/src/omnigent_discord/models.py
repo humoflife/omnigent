@@ -10,7 +10,7 @@ own JSON transports them as strings.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent_bot_core.events import HostType
@@ -96,3 +96,6 @@ class DiscordTurn:
     workspace: str | None = None
     host_id: str | None = None
     host_type: HostType = "external"
+    # Content blocks for any attached files. Empty for a text-only turn, which
+    # is every turn when uploads are off.
+    blocks: list[dict[str, Any]] = field(default_factory=list)
