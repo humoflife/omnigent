@@ -208,14 +208,14 @@ def saved_card(config: UserConfig, server_url: str) -> Card:
     if config.host_type == "managed":
         # The server creates the sandbox and its working directory, so there is
         # no host name or path of the user's to echo back.
-        where = " in a sandbox this server runs for you"
+        where = f" on {server_url} in a sandbox this server runs for you"
     else:
         host_line = f" on host **{config.host_name}**" if config.host_name else ""
-        where = f"{host_line}, rooted at `{config.workspace}`"
+        where = f"{host_line} on {server_url}, rooted at `{config.workspace}`"
     return Card(
         title="✅ You're set up",
         description=(
-            f"I'll use **{config.agent_name}** on {server_url}{where}.\n"
+            f"I'll use **{config.agent_name}**{where}.\n"
             "Mention me in a channel or DM me to start a session."
         ),
         color=COLOR_POSITIVE,
