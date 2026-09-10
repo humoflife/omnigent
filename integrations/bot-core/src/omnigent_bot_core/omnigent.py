@@ -449,17 +449,30 @@ class OmnigentClient:
         self._logger.info("Created Omnigent session session_id=%s", session_id)
         return session_id
 
-    async def submit_message(self, session_id: str, text: str) -> None:
+    async def submit_message(
+        self,
+        session_id: str,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Send one user message, optionally carrying attachment blocks.
+
+        Attachment blocks lead the content list so the harness sees the files
+        before the text that refers to them.
+        """
         self._logger.info(
-            "Submitting message to Omnigent session_id=%s chars=%s",
+            "Submitting message to Omnigent session_id=%s chars=%s blocks=%s",
             session_id,
             len(text),
+            len(blocks or ()),
         )
+        content: list[dict[str, Any]] = list(blocks or ())
+        content.append({"type": "input_text", "text": text})
         payload = {
             "type": "message",
             "data": {
                 "role": "user",
-                "content": [{"type": "input_text", "text": text}],
+                "content": content,
             },
         }
         response = await self._request("POST", f"/v1/sessions/{session_id}/events", json=payload)
@@ -687,13 +700,14 @@ class OmnigentClient:
         session_id: str,
         text: str,
         *,
+        blocks: list[dict[str, Any]] | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
         host_type: HostType = "external",
         idle_grace_seconds: float = 600.0,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
-            async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
+            async for event in self._run_turn_once(session_id, text, idle_grace_seconds, blocks):
                 yield event
             return
         except RunnerUnavailableError:
@@ -729,7 +743,7 @@ class OmnigentClient:
                     session_id,
                 )
 
-        async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
+        async for event in self._run_turn_once(session_id, text, idle_grace_seconds, blocks):
             yield event
 
     async def _run_turn_once(
@@ -737,6 +751,7 @@ class OmnigentClient:
         session_id: str,
         text: str,
         idle_grace_seconds: float,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # Turn-end detection is SERVER-AUTHORITATIVE and HARNESS-AGNOSTIC,
         # mirroring the web UI's reducer. The discriminator is "is a response
@@ -813,7 +828,7 @@ class OmnigentClient:
                     if not submitted:
                         # Submit ONCE: the server keeps running the turn across a
                         # reconnect, so re-submitting would start a second turn.
-                        await self.submit_message(session_id, text)
+                        await self.submit_message(session_id, text, blocks)
                         submitted = True
                     iterator = events.__aiter__()
                     # A single in-flight "next event" task. A liveness timeout must
