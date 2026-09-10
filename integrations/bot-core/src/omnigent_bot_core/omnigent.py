@@ -56,6 +56,7 @@ __all__ = [
     "OmnigentClientPool",
     "OmnigentError",
     "OutputFile",
+    "RunnerAlreadyBoundError",
     "RunnerUnavailableError",
     "ServerUnreachableError",
     "SessionActivity",
@@ -80,6 +81,16 @@ _logger = logging.getLogger(__name__)
 
 class RunnerUnavailableError(OmnigentError):
     pass
+
+
+class RunnerAlreadyBoundError(OmnigentError):
+    """The session already has a runner, so another cannot be launched.
+
+    Distinct from :class:`RunnerUnavailableError`: that one means the stream
+    found no usable runner, which can equally mean "none exists" or "one exists
+    but was too slow to subscribe". Only the second is recoverable by simply
+    re-opening the stream, and this is how the server tells the two apart.
+    """
 
 
 class AuthRequiredError(OmnigentError):
@@ -534,6 +545,18 @@ class OmnigentClient:
                 response.text,
             )
             raise HostUnavailableError(f"Omnigent host {target_host} is not available.")
+        # The endpoint documents exactly one 400: the session already has a
+        # runner bound (404/409/403/401 cover every other rejection). The body
+        # is logged rather than raised, so an unexpected 400 is still diagnosable
+        # without putting server text in a thread-facing message.
+        if response.status_code == 400:
+            self._logger.info(
+                "Session already has a runner bound session_id=%s host=%s body=%r",
+                session_id,
+                target_host,
+                response.text,
+            )
+            raise RunnerAlreadyBoundError(f"Session {session_id} already has a runner.")
         await _raise_for_status(response)
         payload = response.json()
         runner_id = _extract_runner_id(payload)
@@ -692,7 +715,19 @@ class OmnigentClient:
                 "launching a fresh runner and retrying session_id=%s",
                 session_id,
             )
-            await self.launch_runner(session_id, workspace=workspace, host_id=host_id)
+            try:
+                await self.launch_runner(session_id, workspace=workspace, host_id=host_id)
+            except RunnerAlreadyBoundError:
+                # A runner IS bound; it was simply not subscribed yet when the
+                # stream gave up (a cold start outruns the server's relay wait).
+                # Re-opening the stream is the recovery, not a second runner.
+                # Safe to retry: submit_message runs inside the stream context,
+                # so the failed attempt never submitted the message.
+                self._logger.info(
+                    "Runner was already bound; re-opening the stream instead of "
+                    "launching another session_id=%s",
+                    session_id,
+                )
 
         async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
             yield event
