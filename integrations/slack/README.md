@@ -19,8 +19,11 @@ an app manifest** → pick the workspace → paste
 [`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml). That sets
 Socket Mode, Interactivity, the default scopes and events below, and the
 `/omnigent` command in one step. For Databricks web-auth, uncomment
-`users:read` and `users:read.email` in the manifest before pasting it. Then skip
-to step 5.
+`users:read` and `users:read.email` in the manifest before pasting it. A
+manifest cannot mint tokens, so finish with the two steps from the manifest
+header — generate a `connections:write` app-level token (**Basic Information →
+App-Level Tokens**) and **Install to Workspace** for the bot token — then
+continue from step 5.
 
 Doing it by hand instead:
 
