@@ -17,8 +17,10 @@ Omnigent identity against it.
 [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From
 an app manifest** → pick the workspace → paste
 [`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml). That sets
-Socket Mode, Interactivity, every scope and event below, and the `/omnigent`
-command in one step. Then skip to step 5.
+Socket Mode, Interactivity, the default scopes and events below, and the
+`/omnigent` command in one step. For Databricks web-auth, uncomment
+`users:read` and `users:read.email` in the manifest before pasting it. Then skip
+to step 5.
 
 Doing it by hand instead:
 
