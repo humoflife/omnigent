@@ -762,6 +762,43 @@ def test_session_git_existing_worktree_rejects_base_branch() -> None:
         SessionGitOptions(branch_name="feature/x", base_branch="main", existing_worktree=True)
 
 
+def test_session_git_existing_branch_rejects_base_branch() -> None:
+    """Recreate mode + ``base_branch`` is contradictory and rejected (422).
+
+    An existing branch has no base to fork; sending both would be an
+    ambiguous request.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="base_branch cannot be set when existing_branch is true"
+    ):
+        SessionGitOptions(branch_name="fix-1", base_branch="main", existing_branch=True)
+
+
+def test_session_git_existing_branch_rejects_existing_worktree() -> None:
+    """``existing_branch`` and ``existing_worktree`` are distinct modes (422).
+
+    Bind mode reuses a directory that exists; recreate mode makes a new
+    directory for a branch that exists — both at once is contradictory.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="existing_branch and existing_worktree cannot both be true"
+    ):
+        SessionGitOptions(branch_name="fix-1", existing_branch=True, existing_worktree=True)
+
+
+def test_session_git_existing_branch_ok() -> None:
+    """Recreate mode alone validates cleanly and round-trips the flag."""
+    from omnigent.server.schemas import SessionGitOptions
+
+    git = SessionGitOptions(branch_name="fix-1", existing_branch=True)
+    assert git.existing_branch is True
+    assert git.base_branch is None
+
+
 def test_session_git_existing_worktree_with_host_id_ok() -> None:
     """Bind mode with ``host_id`` and no ``base_branch`` validates cleanly."""
     from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
@@ -961,6 +998,78 @@ def test_session_metadata_external_rejects_repo_url_workspace() -> None:
 
     with pytest.raises(ValidationError, match="requires host_type 'managed'"):
         SessionCreateMetadata(workspace="https://github.com/org/repo")
+
+
+def test_session_fork_host_type_defaults_external() -> None:
+    """
+    ``SessionForkRequest.host_type`` defaults to ``"external"`` — every
+    existing fork client keeps producing an unbound clone (backcompat).
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    req = SessionForkRequest()
+    assert req.host_type == "external"
+    assert req.sandbox_provider is None
+    assert req.workspace is None
+
+
+def test_session_fork_managed_accepts_provider_and_repo_workspace() -> None:
+    """
+    ``host_type="managed"`` accepts the provider pick and the
+    ``<repo>[#<branch>]`` workspace the launch path clones into the sandbox.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    req = SessionForkRequest(
+        host_type="managed",
+        sandbox_provider="modal",
+        workspace="https://github.com/org/repo#release-1.2",
+    )
+    assert req.sandbox_provider == "modal"
+    assert req.workspace == "https://github.com/org/repo#release-1.2"
+
+
+def test_session_fork_managed_rejects_path_workspace() -> None:
+    """
+    A managed fork's ``workspace`` is a repository URL, not a path — the
+    sandbox has no filesystem to point at until the server makes one.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="takes a git repository URL"):
+        SessionForkRequest(host_type="managed", workspace="/tmp/w")
+
+
+def test_session_fork_external_rejects_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` without ``host_type="managed"`` 422s — an external
+    fork is not server-provisioned, so naming a provider is a contradiction
+    the caller must see rather than have silently dropped.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="sandbox_provider only applies"):
+        SessionForkRequest(sandbox_provider="modal")
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    ["https://github.com/org/repo", "/tmp/w"],
+)
+def test_session_fork_external_rejects_any_workspace(workspace: str) -> None:
+    """
+    ``workspace`` without ``host_type="managed"`` 422s — for EITHER form.
+
+    This is the one place the fork contract deliberately diverges from the
+    create contract: a create's external workspace is a real host path, so
+    only the repository-URL form is rejected there. A fork picks its
+    directory later, when it binds a host, so a path is just as meaningless
+    as a URL and both must fail loud rather than be silently discarded.
+    """
+    from omnigent.server.schemas import SessionForkRequest
+
+    with pytest.raises(ValidationError, match="workspace only applies"):
+        SessionForkRequest(workspace=workspace)
 
 
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])
