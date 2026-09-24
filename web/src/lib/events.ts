@@ -68,6 +68,8 @@ export interface ResponseCompleted {
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  /** Where the failure originated, when supplied by the server. */
+  source?: string;
 }
 
 /** `response.incomplete` — stopped early. */
@@ -254,6 +256,13 @@ export interface ElicitationRequest {
    */
   allowAllEdits?: boolean;
   /**
+   * Producer-supplied extra (eligible claude-native tool prompts): when
+   * true, the ApprovalCard offers "Approve & switch to auto mode" —
+   * accepting with ``allow_auto_mode`` echoes a session-scoped
+   * ``setMode(auto)`` in the hook decision.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
@@ -283,6 +292,20 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
+  /**
+   * Why the prompt resolved without a verdict, when the server knows:
+   * `"unanswered"` means the hook stopped waiting (a severed poll never
+   * re-parked, the ask timed out) before anyone answered, so the prompt
+   * is gone rather than decided. Never present alongside `action`.
+   */
+  reason?: "unanswered";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */
@@ -301,6 +324,8 @@ export interface MessageDone {
   content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
+  /** Native live-preview stream finalized by this item. */
+  messageId?: string;
 }
 
 /**
@@ -863,20 +888,6 @@ export interface SessionTerminalActivityEvent {
 }
 
 /**
- * `session.skills` — the session's runner-owned skills just resolved
- * (the server's background fetch populated its per-session skills cache).
- * Skills are fetched off the snapshot hot path, so the snapshot serves
- * an empty list until the fetch lands; this event is the "skills are
- * ready, re-read the snapshot" nudge. Consumers refetch the session
- * snapshot and apply its now-populated `skills` to fill the composer's
- * slash-command menu. Carries no payload beyond the conversation id.
- */
-export interface SessionSkillsEvent {
-  type: "session_skills";
-  conversationId: string;
-}
-
-/**
  * `session.model_options` — a runner-owned native model catalog just resolved.
  * Consumers refetch the session snapshot and apply its now-populated options.
  */
@@ -926,6 +937,25 @@ export interface SessionSupersededEvent {
   targetConversationId: string;
   /** Why the session was superseded. Currently always `"clear"`. */
   reason: "clear";
+}
+
+/**
+ * `session.btw_sidechat` — a transient side-chat answer from `/btw` command.
+ *
+ * Broadcast-only (never persisted, no SSE replay). The answer appears in a
+ * dismissable overlay near the composer — not as a persisted message — and
+ * Escape closes it. Nothing persists; a reload drops it.
+ */
+export interface SessionBtwSidechatEvent {
+  type: "session_btw_sidechat";
+  /** The conversation this side-chat was spawned in. */
+  conversationId: string;
+  /** The original `/btw` question text. */
+  question: string;
+  /** The assistant's answer. */
+  answer: string;
+  /** True when the answer was truncated (user should check the terminal for full response). */
+  truncated: boolean;
 }
 
 /**
@@ -999,7 +1029,7 @@ export type StreamEvent =
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
-  | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionBtwSidechatEvent
   | BrowserActionRequestEvent;

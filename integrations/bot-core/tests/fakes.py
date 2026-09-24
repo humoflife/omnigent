@@ -39,6 +39,7 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     ("GET", "/v1/hosts/{host_id}/filesystem", True),
     # Session lifecycle.
     ("POST", "/v1/sessions", True),
+    ("DELETE", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}", True),
     ("GET", "/v1/sessions/{session_id}/items", True),
     ("GET", "/v1/sessions/{session_id}/stream", True),
