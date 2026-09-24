@@ -31,6 +31,7 @@ from omnigent_bot_core.events import SessionActivity
 from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HostUnavailableError,
+    RunnerUnavailableError,
     ServerUnreachableError,
 )
 from omnigent_discord.models import ChannelKey, UserConfig
@@ -859,3 +860,69 @@ async def test_a_managed_session_stays_managed_after_the_user_switches_setup(
 
     assert harness.client.launched == []
     assert harness.client.submitted == ["carry on"]
+
+
+async def test_failed_runner_launch_does_not_strand_a_session(harness: Harness) -> None:
+    """A session nothing can find again must not be left on the server.
+
+    The channel→session binding is written only after the launch succeeds, so a
+    session created before a failed launch is unreachable forever. Deleting it
+    keeps a retry from piling up orphans.
+    """
+    harness.client.launch_error = HostUnavailableError("host went away")
+
+    message = dm("hello")
+    await harness.deliver(message)
+
+    assert harness.client.deleted == [harness.client.session_id]
+    # The user still hears why the turn failed.
+    assert any(f"omni host --server {SERVER}" in text for text in message.channel.texts)
+
+
+async def test_a_delete_failure_still_reports_the_launch_failure(harness: Harness) -> None:
+    """Cleanup is best-effort: it must never swallow the user's message."""
+    harness.client.launch_error = HostUnavailableError("host went away")
+    harness.client.delete_error = RuntimeError("delete refused")
+
+    message = dm("hello")
+    await harness.deliver(message)
+
+    # The delete was attempted and its failure swallowed.
+    assert harness.client.delete_attempts == [harness.client.session_id]
+    assert harness.client.deleted == []
+    assert message.channel.texts, "the launch failure must still be delivered"
+
+
+async def test_managed_session_says_the_sandbox_is_not_ready(harness: Harness) -> None:
+    """A managed 503 reads as a sandbox still coming up, not a generic failure."""
+    await harness.store.upsert_user_config(
+        str(OWNER.id),
+        UserConfig(
+            agent_id="ag_1",
+            agent_name="debby",
+            workspace="",
+            host_id=None,
+            host_name=None,
+            host_type="managed",
+        ),
+    )
+    harness.client.turn_error = RunnerUnavailableError("no runner")
+
+    message = dm("hello")
+    await harness.deliver(message)
+
+    said = " ".join(message.channel.texts + harness.dm_channel.texts)
+    assert "managed sandbox isn't ready yet" in said
+    assert "Something went wrong" not in said
+
+
+async def test_external_session_says_no_runner_is_available(harness: Harness) -> None:
+    """The same report on the user's own host must not mention a sandbox."""
+    harness.client.turn_error = RunnerUnavailableError("no runner")
+
+    message = dm("hello")
+    await harness.deliver(message)
+
+    said = " ".join(message.channel.texts + harness.dm_channel.texts)
+    assert "No runner is available" in said
+    assert "managed sandbox" not in said
