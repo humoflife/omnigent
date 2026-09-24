@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any
 from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
+    HostType,
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
+    RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
     extract_assistant_text,
@@ -87,6 +89,23 @@ _STREAM_INTERRUPTED_TEXT = (
     "arrive here — send another message if it doesn't."
 )
 
+# Shown when a MANAGED session has no runner: usually the server is still
+# provisioning its sandbox (tens of seconds on a first message), but the server
+# raises the SAME 503 ``runner_unavailable`` when the sandbox launch failed
+# outright, and the client discards the discriminating server message (it may
+# carry internal detail). The wording is therefore cause-neutral: it names the
+# not-ready sandbox and asks for a retry without promising the wait will
+# resolve, and escalates to the operator when it keeps happening.
+_MANAGED_SANDBOX_NOT_READY_TEXT = (
+    "⚠️ Your managed sandbox isn't ready yet. Try again in a moment; if it "
+    "keeps happening, contact your Omnigent operator."
+)
+
+# The same "no runner" report on an EXTERNAL host: no runner is bound, and the
+# mid-turn relaunch-and-retry did not recover one. Waiting is the ask; a host
+# the server knows to be offline raises HostUnavailableError instead.
+_RUNNER_UNAVAILABLE_TEXT = "⚠️ No runner is available for this session yet. Try again in a moment."
+
 _NO_THREAD_PERMISSION_TEXT = (
     "⚠️ I need the **Create Public Threads** permission in this channel to start "
     "a session. Ask a moderator to grant it, or DM me instead."
@@ -126,7 +145,9 @@ class _StreamState:
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
-def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
+def _classify_turn_error(
+    exc: BaseException, server_url: str, *, host_type: HostType
+) -> str | None:
     """Map a known startup/turn error to its public user-facing text.
 
     Single source of truth shared by the session-creation and mid-turn error
@@ -135,6 +156,11 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
     unrecognized error (the caller falls back to the generic failure). Auth
     errors do NOT flow through here — the caller intercepts them for a private
     re-login prompt.
+
+    Pass the turn's ``host_type``: a missing runner reads differently on a
+    managed session (the server's sandbox is still coming up) than on the user's
+    own host. It is required rather than defaulted so a new call site can't
+    silently tell an external-host user their sandbox is starting.
     """
     if isinstance(exc, StreamInterruptedError):
         # A mid-stream drop with reconnect exhausted — the server stayed
@@ -144,6 +170,14 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
         return _SERVER_UNREACHABLE_TEXT
     if isinstance(exc, HostUnavailableError):
         return host_unavailable_text(server_url)
+    if isinstance(exc, RunnerUnavailableError):
+        # No runner is serving the session. Usually recoverable by waiting, but
+        # the managed 503 also covers a failed sandbox launch and the class does
+        # not discriminate — so name the not-ready state instead of the generic
+        # failure, without promising that waiting will resolve it.
+        if host_type == "managed":
+            return _MANAGED_SANDBOX_NOT_READY_TEXT
+        return _RUNNER_UNAVAILABLE_TEXT
     if isinstance(exc, HarnessNotConfiguredError):
         # The server's message is curated, actionable guidance for this code —
         # surface it so the user knows to run `omnigent setup` on the host.
@@ -773,6 +807,23 @@ class DiscordOmnigentService:
             errored,
         )
 
+    async def _discard_unlaunched_session(
+        self, omnigent: OmnigentClient, session_id: str, turn: DiscordTurn
+    ) -> None:
+        """Best-effort delete of a session whose runner launch failed.
+
+        A delete failure is logged and swallowed: the user's launch-failure
+        message must still be delivered.
+        """
+        try:
+            await omnigent.delete_session(session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to delete unlaunched session session_id=%s channel=%s",
+                session_id,
+                turn.key.display(),
+            )
+
     async def _notify_auth_expired(self, turn: DiscordTurn, reply: _AnswerReply) -> None:
         """Privately tell the user their login expired and how to fix it.
 
@@ -831,9 +882,17 @@ class DiscordOmnigentService:
                     session_id,
                 )
             else:
-                runner_id = await omnigent.launch_runner(
-                    session_id, workspace=turn.workspace or "", host_id=turn.host_id
-                )
+                try:
+                    runner_id = await omnigent.launch_runner(
+                        session_id, workspace=turn.workspace or "", host_id=turn.host_id
+                    )
+                except Exception:
+                    # The binding write below never runs when the launch fails,
+                    # so nothing could find this session again — delete it
+                    # rather than strand it on the server (a retry creates a
+                    # fresh one).
+                    await self._discard_unlaunched_session(omnigent, session_id, turn)
+                    raise
         except AuthRequiredError as exc:
             # Expired/lost token: prompt a re-login rather than a plain notice.
             self._logger.info(
@@ -844,12 +903,14 @@ class DiscordOmnigentService:
             ServerUnreachableError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Session startup failed channel=%s: %s", turn.key.display(), exc)
             # These are curated bot-composed messages; fall back to the generic
             # failure rather than str(exc) so no server detail can leak.
             raise _TurnAborted(
-                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
             ) from exc
         except Exception as exc:
             # Any other startup failure (e.g. a 500 surfaced as OmnigentError)
@@ -972,12 +1033,14 @@ class DiscordOmnigentService:
             StreamInterruptedError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Turn error mid-stream channel=%s: %s", turn.key.display(), exc)
             # Curated bot-composed messages; fall back to the generic failure
             # rather than str(exc) so no server detail can leak.
             await reply.stop_with(
-                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
             )
             state.aborted = True
         except Exception:

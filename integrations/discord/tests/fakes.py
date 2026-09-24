@@ -230,6 +230,12 @@ class FakeOmnigent:
         # host_type of each create_session call, so a test can assert a managed
         # session asks the server to provision its own host.
         self.created_host_types: list[str] = []
+        # Sessions deleted via delete_session, so a test can assert a failed
+        # runner launch does not strand one on the server.
+        self.deleted: list[str] = []
+        # Every delete_session call, including ones that raise — the cleanup is
+        # best-effort, so "was it attempted" is the observable behaviour.
+        self.delete_attempts: list[str] = []
         self.launched: list[dict[str, Any]] = []
         self.submitted: list[str] = []
         # Attachment blocks per turn, parallel to ``submitted``.
@@ -238,6 +244,8 @@ class FakeOmnigent:
         # Raise this instead of streaming, to exercise the error paths.
         self.turn_error: Exception | None = None
         self.create_error: Exception | None = None
+        self.launch_error: Exception | None = None
+        self.delete_error: Exception | None = None
         self.resolve_error: Exception | None = None
         # Awaited between yielded events, so a test can interleave assertions.
         self.on_event: Any = None
@@ -254,9 +262,17 @@ class FakeOmnigent:
         self.created_host_types.append(host_type)
         return self.session_id
 
+    async def delete_session(self, session_id: str) -> None:
+        self.delete_attempts.append(session_id)
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted.append(session_id)
+
     async def launch_runner(
         self, session_id: str, *, workspace: str, host_id: str | None = None
     ) -> str:
+        if self.launch_error is not None:
+            raise self.launch_error
         self.launched.append(
             {"session_id": session_id, "workspace": workspace, "host_id": host_id}
         )
