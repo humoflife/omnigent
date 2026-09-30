@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.errors import ErrorCategory
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -33,7 +34,7 @@ def test_classifies_root_permission_failure() -> None:
 
 def test_root_failure_survives_mid_word_truncation() -> None:
     # The pane snapshot may be clipped to "...for secuRITY REASONS" — the
-    # matcher keys on "security reasons", which line-boundary trimming keeps.
+    # matcher keys on "security reasons", which tail trimming keeps.
     diagnosis = classify_terminal_failure(
         command="claude",
         exit_status=1,
@@ -41,6 +42,26 @@ def test_root_failure_survives_mid_word_truncation() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Claude Code can't run as root"
+
+
+@pytest.mark.parametrize(
+    ("command", "exit_status", "output"),
+    [
+        (
+            "env",
+            0,
+            "'--background' is disabled by CLAUDE_CODE_DISABLE_AGENT_VIEW.\n"
+            "Claude Code exited with code 1",
+        ),
+        ("env", 0, "error: unknown option '--codex' (did you mean --model?)"),
+        ("codex", 2, "error: unexpected argument '--foo' found\n\nUsage: codex [OPTIONS]"),
+    ],
+)
+def test_classifies_rejected_arguments(command: str, exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command=command, exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent CLI rejected its launch arguments"
+    assert diagnosis.category is ErrorCategory.CONFIG
 
 
 @pytest.mark.parametrize(
@@ -226,6 +247,9 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("budget_exhausted", "budget"),
+        ("databricks_sign_in_pending", "Databricks sign-in"),
+        ("agent_startup_pending", "still starting"),
+        ("codex_thread_not_started", "never ran"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

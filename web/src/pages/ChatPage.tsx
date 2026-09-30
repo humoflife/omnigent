@@ -113,6 +113,7 @@ import {
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -176,6 +177,7 @@ export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
 import {
   type ConversationScroller,
   SessionSharedContext,
+  computeIsTurnActive,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
@@ -218,7 +220,6 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
-import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
@@ -255,13 +256,7 @@ import {
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
-import {
-  GoalDialog,
-  CommandGoalDialog,
-  GoalStatusPill,
-  useGoalState,
-  type Goal,
-} from "@/components/goal";
+import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -735,7 +730,7 @@ export function ChatPage() {
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
   const isWorking =
-    computeIsWorking(sessionStatus) || status === "streaming" || hasPendingInitialMessage;
+    computeIsTurnActive(sessionStatus, status === "streaming") || hasPendingInitialMessage;
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -2243,15 +2238,14 @@ export function composerHarnessLabel(
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
  * Session cost lives in the header agent-info popover, not here.
  */
-function ComposerStatusLine({ goal }: { goal: Goal | null }) {
+function ComposerStatusLine() {
   const conversationId = useChatStore((s) => s.conversationId);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
 
-  // The PR link and context ring now live in the workspace bar; this line
-  // carries only the plan-mode marker and the goal pill.
+  // The PR link, context ring, and goal indicator live in the workspace bar;
+  // this line carries only the plan-mode marker.
   const showPlanMode = !!conversationId && codexPlanMode;
-  const showGoal = !!conversationId && goal != null;
-  if (!showPlanMode && !showGoal) return null;
+  if (!showPlanMode) return null;
 
   return (
     <div
@@ -2272,7 +2266,6 @@ function ComposerStatusLine({ goal }: { goal: Goal | null }) {
             <span>Plan mode</span>
           </span>
         )}
-        {showGoal && goal && <GoalStatusPill goal={goal} />}
       </div>
     </div>
   );
@@ -2801,7 +2794,7 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
-  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
@@ -2999,14 +2992,45 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
-      case "/compact":
+      case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
+          return true;
+        }
+        if ((sessionHarness === "codex-native" || sessionHarness === "claude-sdk") && arg) {
+          const harnessName = sessionHarness === "codex-native" ? "Codex" : "Claude SDK";
+          setCommandError(`/compact does not accept arguments for ${harnessName}`);
+          return true;
+        }
+        const chat = useChatStore.getState();
+        if (
+          sessionHarness === "codex-native" &&
+          (chat.status === "streaming" || chat.sessionStatus === "running") &&
+          !shouldQueueSend(
+            chat.conversationId,
+            chat.status,
+            chat.sessionStatus,
+            chat.queuedMessages,
+            readAlwaysSteer(),
+          )
+        ) {
+          toast.error("Compact is disabled while a chat is in progress", { richColors: true });
           return true;
         }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        if (
+          sessionHarness === "claude-native" ||
+          sessionHarness === "claude-sdk" ||
+          sessionHarness === "codex-native"
+        ) {
+          // Use the message queue; the store dispatches SDK and Codex as controls.
+          const command = arg ? `/compact ${arg}` : "/compact";
+          appendEntry(command);
+          onSend(command);
+          return true;
+        }
         void useChatStore
           .getState()
           .compact()
@@ -3014,6 +3038,7 @@ function ComposerImpl(
             setCommandError(err instanceof Error ? err.message : "Compact failed");
           });
         return true;
+      }
       case "/effort": {
         if (!showEffort) return false;
         const valid = [...effortLevels, "default"];
@@ -3114,33 +3139,37 @@ function ComposerImpl(
     }
   };
 
-  /**
-   * Called when the user selects a suggestion from the menu (keyboard or
-   * click). Commands that need an argument (``SLASH_COMMANDS_WITH_ARGS``)
-   * fill in the text with a trailing space so the user can type the arg.
-   * All other commands execute immediately.
-   */
+  const completeMenuSelection = (cmd: string) => {
+    const completion = slashCompletion.complete(cmd);
+    setValue(completion.text);
+    dirtyRef.current = true;
+  };
+
+  // Skills insert at the caret; Enter/click executes standalone no-argument built-ins.
   const applyMenuSelection = (cmd: string) => {
-    if (slashCommandsWithArgs.has(cmd)) {
-      // Fill in "cmd " and let the user type the argument.
-      setValue(cmd + " ");
-      dirtyRef.current = true;
-      textareaRef.current?.focus();
+    if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
+      completeMenuSelection(cmd);
     } else {
       // Execute immediately — no argument needed.
-      setValue("");
+      // /compact clears its draft only after the busy guard accepts it.
+      if (cmd !== "/compact") setValue("");
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }
   };
 
-  // Slash-completion menu mechanics (shared useSlashCompletion): the menu
-  // opens while the focused draft is a lone command token with no
-  // attachments, and owns Escape, arrows, and Tab/Enter completion while
-  // open. What a selection does (fill vs execute) stays in the adapter.
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(skills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description])),
+    [skills, skillPrefix],
+  );
+
+  // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobile,
@@ -3148,6 +3177,7 @@ function ComposerImpl(
     escapeClearsOnlyWithContent: true,
     allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
     onSelect: applyMenuSelection,
+    onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
   });
 
@@ -3337,7 +3367,7 @@ function ComposerImpl(
         cmd in BUILTIN_SLASH_COMMANDS &&
         cmd in slashCommands
       ) {
-        executeSlashCommand(cmd, arg);
+        executeSlashCommand(cmd, cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg);
         return;
       }
       // /side opens a side chat. Codex forks in-process (falls through to the
@@ -3534,6 +3564,7 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
@@ -3642,6 +3673,7 @@ function ComposerImpl(
             >
               <BackgroundTaskIndicator />
               <SubagentTaskIndicator conversationId={conversationId} />
+              {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
             </div>
             <ComposerContextRing
               contextWindow={composerContextWindow}
@@ -3662,6 +3694,7 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
+          onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
             setInputFocused(true);
             handleTextFocus(null, e.currentTarget);
@@ -3753,7 +3786,8 @@ function ComposerImpl(
                   query={slashCompletion.query}
                   activeIndex={slashCompletion.index}
                   onSelect={applyMenuSelection}
-                  commands={slashCommands}
+                  commands={slashCompletion.commands}
+                  builtinNames={slashCompletion.builtinNames}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />
@@ -4027,7 +4061,7 @@ function ComposerImpl(
           />
         )
       )}
-      <ComposerStatusLine goal={goal} />
+      <ComposerStatusLine />
     </form>
   );
 }
@@ -4596,7 +4630,7 @@ function SessionHarnessPicker({
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
-  const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
+  const [configOpen, setConfigOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
@@ -4662,12 +4696,12 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       setMenuOpen(true);
-      setConfigMenu(showModels ? "model" : "effort");
+      setConfigOpen(true);
     }
-  }, [openNonce, disabled, configurable, showModels]);
+  }, [openNonce, disabled, configurable]);
   useEffect(() => {
     setMenuOpen(false);
-    setConfigMenu(null);
+    setConfigOpen(false);
     setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
@@ -4722,7 +4756,7 @@ function SessionHarnessPicker({
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (selectedEffort !== null) await store.setEffort(null);
     });
-  const modelContent = (
+  const configContent = (
     <>
       {costRoutingEligible && showModels && (
         <>
@@ -4802,6 +4836,23 @@ function SessionHarnessPicker({
               }
             : undefined
         }
+        efforts={
+          showEffort && availableEfforts.length > 0
+            ? {
+                testId: "composer-agent-efforts",
+                header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+                choices: availableEfforts.map((effort) => ({
+                  key: effort,
+                  label: formatStatusEffortLabel(effort) ?? effort,
+                  checked: !routingOn && effort === selectedEffort,
+                  disabled: routingOn || busy || pendingModelChange !== null,
+                  onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                  testId: `composer-agent-effort-${effort}`,
+                  data: { "data-effort-level": effort },
+                })),
+              }
+            : undefined
+        }
         extra={
           composerFusion !== undefined && fusionSelected && !routingOn
             ? buildFusionSections({
@@ -4816,34 +4867,13 @@ function SessionHarnessPicker({
       />
     </>
   );
-  const effortContent = (
-    <ComposerConfigSections
-      efforts={
-        showEffort && availableEfforts.length > 0
-          ? {
-              testId: "composer-agent-efforts",
-              header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-              choices: availableEfforts.map((effort) => ({
-                key: effort,
-                label: formatStatusEffortLabel(effort) ?? effort,
-                checked: !routingOn && effort === selectedEffort,
-                disabled: routingOn || busy || pendingModelChange !== null,
-                onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
-                testId: `composer-agent-effort-${effort}`,
-                data: { "data-effort-level": effort },
-              })),
-            }
-          : undefined
-      }
-    />
-  );
   return (
     <>
       <HarnessPicker
         open={menuOpen}
         onOpenChange={(next) => {
           if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigMenu(null);
+          if (!next) setConfigOpen(false);
         }}
         trigger={{
           label: "Configure session",
@@ -4864,59 +4894,28 @@ function SessionHarnessPicker({
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
       >
-        {isMobile && configMenu !== null ? (
+        {isMobile && configOpen ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"
-            testId={
-              configMenu === "model" ? "composer-agent-config-menu" : "composer-agent-effort-menu"
-            }
-            onBack={() => setConfigMenu(null)}
+            testId="composer-agent-config-menu"
+            onBack={() => setConfigOpen(false)}
           >
-            {configMenu === "model" ? modelContent : effortContent}
+            {configContent}
           </HarnessPickerConfigPage>
         ) : (
-          <>
-            <PickerSectionHeader>
-              {nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-            </PickerSectionHeader>
-            {showModels && (
-              <HarnessPickerConfigRow
-                label="Model"
-                value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
-                open={configMenu === "model"}
-                onOpenChange={(open) =>
-                  setConfigMenu((current) =>
-                    open ? "model" : current === "model" ? null : current,
-                  )
-                }
-                isMobile={isMobile}
-                disabled={busy || pendingModelChange !== null}
-                valueTestId="composer-agent-model-summary"
-                testId="composer-agent-edit"
-                configTestId="composer-agent-config-menu"
-              >
-                {modelContent}
-              </HarnessPickerConfigRow>
-            )}
-            {showEffort && availableEfforts.length > 0 && (
-              <HarnessPickerConfigRow
-                label={modelPickerKind === "pi" ? "Thinking level" : "Effort"}
-                value={routingOn ? "Automatic" : (effortLabel ?? "Default")}
-                open={configMenu === "effort"}
-                onOpenChange={(open) =>
-                  setConfigMenu((current) =>
-                    open ? "effort" : current === "effort" ? null : current,
-                  )
-                }
-                isMobile={isMobile}
-                disabled={routingOn || busy || pendingModelChange !== null}
-                testId="composer-agent-effort-select"
-                configTestId="composer-agent-effort-menu"
-              >
-                {effortContent}
-              </HarnessPickerConfigRow>
-            )}
-          </>
+          <HarnessPickerConfigRow
+            label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+            value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+            open={configOpen}
+            onOpenChange={setConfigOpen}
+            isMobile={isMobile}
+            disabled={busy || pendingModelChange !== null}
+            valueTestId="composer-agent-model-summary"
+            testId="composer-agent-edit"
+            configTestId="composer-agent-config-menu"
+          >
+            {configContent}
+          </HarnessPickerConfigRow>
         )}
       </HarnessPicker>
       {error && (

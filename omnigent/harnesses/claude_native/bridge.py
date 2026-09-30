@@ -1,4 +1,9 @@
-"""Bridge utilities for the native Claude Code wrapper.
+"""Claude terminal utilities and the shared native-harness MCP relay.
+
+The ``serve-mcp`` entrypoint and tool relay also serve Codex, Antigravity,
+OpenCode, Cursor, Hermes, Kiro, Qwen and ACP clients. The historical module
+path remains stable; shared result conversion lives in
+``omnigent.runtime.mcp_tool_result``.
 
 The native wrapper has two live processes that need to rendezvous:
 
@@ -64,7 +69,8 @@ from filelock import Timeout as FileLockTimeout
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
-from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
+from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -74,6 +80,7 @@ if TYPE_CHECKING:
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
 
 from omnigent.inner.hook_scripts.subagent_router import (
@@ -565,6 +572,30 @@ class ClaudeTerminalDialog(RuntimeError):
     """
 
 
+class ClaudeSignInPending(RuntimeError):
+    """
+    Claude Code's terminal is parked on a launcher sign-in prompt.
+
+    A wrapper in front of the ``claude`` binary printed an address to open
+    (often with a device code) and is waiting for the person to sign in.
+    Like :class:`ClaudeTerminalDialog` this is deliberately not a
+    :class:`ClaudePromptTimeout`: the pane is alive and the sign-in is
+    finished from the card's link, so delivery handlers must not reap it.
+
+    :param message: Human-readable failure text.
+    :param title: Card headline, e.g.
+        ``"Claude Code can't start until you sign in to Databricks"``.
+    :param remediation: The link (and code) to open, phrased as the next step.
+    """
+
+    code = "databricks_sign_in_pending"
+
+    def __init__(self, message: str, *, title: str, remediation: str) -> None:
+        super().__init__(message)
+        self.title = title
+        self.remediation = remediation
+
+
 class ClaudeInjectionCancelled(RuntimeError):
     """The caller cancelled delivery before the injection worker finished."""
 
@@ -717,7 +748,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = opencode_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
-    kiro_root = _absolute_syntactic_path(kiro_bridge_root())
+    kiro_root = _absolute_syntactic_path(kiro_bridge.bridge_root())
     if target.is_relative_to(kiro_root):
         # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/kiro-native): trust
         # the uid-scoped temp dir's parent and validate/chmod the two
@@ -773,6 +804,10 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param subagent_return_id: Claude's native task id for an explicit
+        handback; transported separately from model-visible message content.
+    :param agent_message_candidate: Unproven team-shaped user text; the server
+        must correlate it by text without draining unrelated pending input.
     """
 
     source_id: str
@@ -781,6 +816,8 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    subagent_return_id: str | None = None
+    agent_message_candidate: bool = False
 
 
 @dataclass(frozen=True)
@@ -903,6 +940,11 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_category: ``StopFailure`` error category, e.g.
+        ``"rate_limit"``. ``None`` for other events or when absent.
+    :param failure_message: ``StopFailure`` error text Claude Code rendered
+        for the turn (the payload's ``last_assistant_message``), e.g.
+        ``"API Error: 500 Internal server error"``. ``None`` when absent.
     """
 
     event_cursor: int
@@ -923,6 +965,8 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_category: str | None = None
+    failure_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2064,10 +2108,24 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
                 ],
                 "env": {
                     "PYTHONUNBUFFERED": "1",
+                    # The bridge root is derived from tempfile at import time.
+                    # Keep it aligned with the runner when Claude inherits a
+                    # different TMPDIR from the user's shell.
+                    "TMPDIR": str(_TRUSTED_PARENT),
                 },
             }
         }
     }
+
+
+def _pin_runner_tmpdir(command: str) -> str:
+    """Run a generated command with the runner's temp root."""
+    return f"env TMPDIR={shlex.quote(str(_TRUSTED_PARENT))} {command}"
+
+
+def _python_hook_command(parts: list[str]) -> str:
+    """Build a Python hook command pinned to the runner's temp root."""
+    return _pin_runner_tmpdir(shlex.join(parts))
 
 
 def build_hook_settings(
@@ -2156,7 +2214,7 @@ def build_hook_settings(
     # Claude owns command-hook stderr, so it does not reach the runner logs.
     # Persist it for the forwarder to relay with the Omnigent session id.
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
-    command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
+    command = f"{_python_hook_command(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
     framework_context_parts = [
         python,
@@ -2169,7 +2227,7 @@ def build_hook_settings(
     ]
     framework_context_hook = {
         "type": "command",
-        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+        "command": f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}",
     }
     session_start_hook = {
         "type": "command",
@@ -2241,9 +2299,9 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    hooks["PostToolUse"].append(
-        {"hooks": [hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")]}
-    )
+    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
+    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
@@ -2274,7 +2332,7 @@ def build_hook_settings(
         ]
         permission_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(permission_command_parts),
+            "command": _python_hook_command(permission_command_parts),
             # Wait up to a day for the verdict. Claude Code's default
             # command-hook timeout (~60s) would otherwise kill the hook
             # subprocess long before the user answers, putting the
@@ -2298,7 +2356,7 @@ def build_hook_settings(
         # path and the phase-aware fail-closed contract — exactly the
         # pre-curl behavior.
         relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
-        evaluate_policy_python = shlex.join(
+        evaluate_policy_python = _python_hook_command(
             [
                 python,
                 "-I",
@@ -2363,7 +2421,7 @@ def build_hook_settings(
 
         router_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(router_command_parts),
+            "command": _python_hook_command(router_command_parts),
             # Outermost hop of the routing timeout budget documented in
             # ``omnigent.runner.subagent_routing``: derived from the hook
             # script's own request budget so it always exceeds it and the
@@ -2433,7 +2491,7 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
 
     return {
         "type": "command",
-        "command": shlex.join(
+        "command": _python_hook_command(
             [
                 python,
                 "-I",
@@ -3156,6 +3214,7 @@ def read_transcript_items_from_offset(
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
     include_sidechains: bool = False,
+    legacy_agent_messages: bool = False,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -3184,6 +3243,8 @@ def read_transcript_items_from_offset(
         leave the sub-agent's child Omnigent conversation empty. The
         default ``False`` keeps the parent-transcript path
         unchanged.
+    :param legacy_agent_messages: Offline imports hide unproven historical
+        team envelopes; preserve assistant response identity across them.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -3217,6 +3278,7 @@ def read_transcript_items_from_offset(
                 TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
             )
             continue
+        previous_response_id = active_response_id
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -3226,6 +3288,8 @@ def read_transcript_items_from_offset(
             settled_response_id=active_settled_id,
             include_sidechains=include_sidechains,
         )
+        if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
+            active_response_id = previous_response_id
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
         # the compact summary AND the resumed output must not parse the
@@ -3709,6 +3773,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_category: str | None = None
+    failure_message: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
+        # The CLI renders this text for its own error, so it reads like the
+        # mirrored API-error message.
+        raw_message = _bounded_hook_text(
+            payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
+        )
+        failure_message = (
+            _display_text(raw_message, is_api_error=True) if raw_message is not None else None
+        )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -3752,7 +3828,28 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_category=failure_category,
+        failure_message=failure_message,
     )
+
+
+# Bounds on ``StopFailure`` text copied into the failed status edge.
+_FAILURE_CATEGORY_MAX_CHARS = 100
+_FAILURE_MESSAGE_MAX_CHARS = 4000
+
+
+def _bounded_hook_text(value: object, max_chars: int) -> str | None:
+    """
+    Return a stripped, length-bounded hook string field.
+
+    :param value: Raw payload value, e.g. ``"rate_limit"``.
+    :param max_chars: Maximum characters kept, e.g. ``100``.
+    :returns: The trimmed text, or ``None`` when absent, blank, or not a string.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:max_chars] if text else None
 
 
 def _read_complete_jsonl_records(
@@ -5073,7 +5170,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
-def _capture_pane(socket_path: str, tmux_target: str) -> str:
+def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
     """
     Capture the current visible contents of a tmux pane.
 
@@ -5084,14 +5181,20 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param join_wrapped: Join rows the pane wrapped at its width back into one
+        line (``capture-pane -J``), so an address wider than the pane reads
+        back whole.
     :returns: The pane's visible text, or ``""`` if capture failed.
     """
     import subprocess
 
     _check_injection_cancelled()
+    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
+    if join_wrapped:
+        args.append("-J")
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
+            args,
             check=False,
             capture_output=True,
             text=True,
@@ -5217,6 +5320,18 @@ def claude_pane_text_ready(pane: str) -> bool:
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Claude's composer is on screen.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live Claude terminal.
+    :returns: Whether the watcher's last captured pane shows the prompt.
+    """
+    del session_id
+    # The watcher already captured this live pane; no extra tmux query.
+    return claude_pane_text_ready(instance.last_pane_text() or "")
 
 
 def _user_prompt_visible(pane: str) -> bool:
@@ -5771,6 +5886,10 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
+    :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
+        open, often with a device code) holds the pane on two consecutive
+        polls. Raised within a poll interval with the link attached, so the
+        card can offer it; the pane is left alive for the sign-in to finish.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5795,6 +5914,7 @@ def _wait_for_claude_prompt_ready(
     exited_status: str | None = None
     pane_exited = False
     dialog_headline: str | None = None
+    sign_in_url: str | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5826,6 +5946,24 @@ def _wait_for_claude_prompt_ready(
                 "prompt, then resend your message." + _format_terminal_failure_tail(pane)
             )
         dialog_headline = headline
+        # A launcher sign-in prompt printed before Claude Code runs: an address
+        # to open, often with a device code. Real when the same address shows
+        # on two consecutive polls. Fail now with the link rather than wait out
+        # the budget and reap the pane the person needs to finish signing in.
+        # The joined capture keeps an address wider than the pane in one piece.
+        sign_in = (
+            detect_sign_in_prompt(_capture_pane(socket_path, tmux_target, join_wrapped=True))
+            if "http" in pane
+            else None
+        )
+        if sign_in is not None and sign_in.url == sign_in_url:
+            raise ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation=sign_in_next_step("Claude Code"),
+            )
+        sign_in_url = sign_in.url if sign_in is not None else None
         now = time.monotonic()
         if now >= hard_deadline:
             break
@@ -5940,7 +6078,7 @@ def start_tool_relay(
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> ClaudeNativeToolRelay:
     """
-    Start a relay for Omnigent tool calls from Claude.
+    Start the shared relay for native-harness Omnigent tool calls.
 
     Writes ``tool_relay.json`` and starts the HTTP server that backs it
     (see :func:`_start_bridge_http_server` for the bind/advertise rules).
@@ -6586,20 +6724,10 @@ async def _await_tool_result(result: Awaitable[object]) -> object:
 
 
 def _mcp_response_from_tool_result(result: object) -> _JsonObject:
-    """
-    Convert a harness tool result into MCP response shape.
+    """Convert relay results without loading the runtime on observer hook imports."""
+    from omnigent.runtime.mcp_tool_result import mcp_response_from_tool_result
 
-    :param result: Result returned by ``_tool_executor``. Existing
-        harnesses usually return a dict, e.g. ``{"result": "ok"}``.
-    :returns: MCP tool-call response.
-    """
-    payload = result if isinstance(result, dict) else {"result": result}
-    response: _JsonObject = {
-        "content": [{"type": "text", "text": json.dumps(payload)}],
-    }
-    if payload.get("blocked") is True or ("error" in payload and payload.get("error")):
-        response["isError"] = True
-    return response
+    return mcp_response_from_tool_result(result)
 
 
 def _notification_writer(
@@ -7663,10 +7791,30 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("type") != "queued_command":
         return current_response_id, []
-    if attachment.get("commandMode") != "prompt":
-        return current_response_id, []
     prompt = attachment.get("prompt")
     if not isinstance(prompt, str) or not prompt:
+        return current_response_id, []
+    return_id = _subagent_handback_id(attachment.get("origin"))
+    if return_id is not None or _is_task_completion_text(prompt):
+        source_key = _transcript_source_key(entry, line_number, record_offset)
+        return current_response_id, [
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "message"),
+                item_type="message",
+                data={
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+                response_id=_response_id_from_source(source_key),
+                subagent_return_id=return_id,
+            )
+        ]
+    if attachment.get("commandMode") != "prompt":
+        return current_response_id, []
+    if attachment.get("isMeta") is True:
+        return current_response_id, []
+    if _is_trusted_agent_notification_text(prompt, origin=attachment.get("origin")):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     item = ClaudeTranscriptItem(
@@ -7677,6 +7825,9 @@ def _attachment_transcript_items_from_entry(
             "content": [{"type": "input_text", "text": _unwrap_pasted_content_markers(prompt)}],
         },
         response_id=_response_id_from_source(source_key),
+        agent_message_candidate=_is_agent_notification_text(
+            _unwrap_pasted_content_markers(prompt)
+        ),
     )
     return None, [item]
 
@@ -7743,6 +7894,20 @@ _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
     "</task-notification>",
+)
+_TEAMMATE_MESSAGE_RE = re.compile(
+    r'(?:<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>.*?</teammate-message>'
+    r'|<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>.*?</agent-message>)',
+    re.DOTALL,
+)
+_TEAMMATE_MESSAGE_PREFIXES = (
+    "Another Claude session sent a message:\n",
+    "Another Claude session sent a message while you were working:\n",
+    "A peer session sent a message while you were working:\n",
+)
+_TEAMMATE_DELIVERY_GUIDANCE = (
+    "This came from another Claude session — not typed by your user,",
+    'That "other Claude session" is an agent working inside this same session —',
 )
 
 # Substrings Claude Code writes to a ``/compact`` command's
@@ -8028,10 +8193,55 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
-def _is_task_notification_text(text: str) -> bool:
+def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
+    """Honor native peer provenance and the existing task-notification boundary."""
+    if isinstance(origin, dict) and origin.get("kind") == "peer":
+        return True
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(
         marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    )
+
+
+def _is_agent_notification_text(text: str) -> bool:
+    """Recognize possible agent context; text alone does not prove its origin."""
+    if _is_trusted_agent_notification_text(text):
+        return True
+    stripped = text.lstrip()
+    wrapped = False
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].lstrip()
+            wrapped = True
+            break
+    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+        return False
+    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
+        stripped = stripped[match.end() :].lstrip()
+        if not stripped:
+            return True
+    # Wrapped peer messages can append Claude's own explanatory guidance.
+    return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+
+
+def _subagent_handback_id(origin: object) -> str | None:
+    """Read Claude's explicit returned-result provenance, excluding teammate chatter."""
+    if (
+        not isinstance(origin, dict)
+        or origin.get("kind") != "peer"
+        or origin.get("handback") is not True
+    ):
+        return None
+    task_id = origin.get("senderTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _is_task_completion_text(text: str) -> bool:
+    return (
+        text.lstrip().startswith("<task-notification>")
+        and _is_agent_notification_text(text)
+        and re.search(r"<status>\s*(?:completed|failed|cancelled|killed)\s*</status>", text)
+        is not None
     )
 
 
@@ -8186,12 +8396,27 @@ def _user_transcript_items_from_entry(
     :returns: Updated active response id and parsed user/tool-result
         items.
     """
-    # ``isMeta=true`` carries CLI scaffolding like
-    # ``<local-command-caveat>``; no user-visible content.
-    if entry.get("isMeta") is True:
-        return current_response_id, []
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
+    return_id = _subagent_handback_id(entry.get("origin"))
+    notification_texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    # Keep hidden completion provenance so the parent can link the returned child.
+    if (
+        entry.get("isMeta") is True
+        and return_id is None
+        and not any(_is_task_completion_text(text) for text in notification_texts)
+    ):
+        return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
 
@@ -8228,6 +8453,28 @@ def _user_transcript_items_from_entry(
     if isinstance(content, str):
         if not content:
             return current_response_id, []
+        if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
+            content, origin=entry.get("origin")
+        ):
+            items.append(
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "message"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "is_meta": True,
+                        "content": [{"type": "input_text", "text": content}],
+                    },
+                    response_id=fallback_response_id,
+                    subagent_return_id=return_id,
+                )
+            )
+            return (
+                None
+                if content.lstrip().startswith("<task-notification>")
+                else current_response_id,
+                items,
+            )
         stripped = content.lstrip()
         # Skill invocations with args ship the tag order
         # ``<command-message>…<command-name>…<command-args>…`` — i.e.
@@ -8283,20 +8530,6 @@ def _user_transcript_items_from_entry(
         # of leaking as user bubbles.
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
-        if _is_task_notification_text(content):
-            items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "message"),
-                    item_type="message",
-                    data={
-                        "role": "user",
-                        "is_meta": True,
-                        "content": [{"type": "input_text", "text": content}],
-                    },
-                    response_id=fallback_response_id,
-                )
-            )
-            return None, items
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "message"),
@@ -8308,6 +8541,9 @@ def _user_transcript_items_from_entry(
                     ],
                 },
                 response_id=fallback_response_id,
+                agent_message_candidate=_is_agent_notification_text(
+                    _unwrap_pasted_content_markers(content)
+                ),
             )
         )
         return None, items
@@ -8326,19 +8562,9 @@ def _user_transcript_items_from_entry(
             text = block.get("text")
             if not isinstance(text, str) or not text:
                 continue
-            # Defensively guard against slash-command markup or other
-            # CLI-scaffolding markers ever arriving in list-form
-            # content. Today these only ship in string content (the
-            # branch above), but Claude Code's JSONL format is not
-            # under our control — without this filter, a format
-            # change would regress to rendering ``<command-name>…``
-            # markup as a user bubble.
-            stripped = text.lstrip()
-            if "<command-name>" in stripped or any(
-                stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
+            if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
+                text, origin=entry.get("origin")
             ):
-                continue
-            if _is_task_notification_text(text):
                 items.append(
                     ClaudeTranscriptItem(
                         source_id=_source_id(source_key, item_index, "message"),
@@ -8349,10 +8575,18 @@ def _user_transcript_items_from_entry(
                             "content": [{"type": "input_text", "text": text}],
                         },
                         response_id=fallback_response_id,
+                        subagent_return_id=return_id,
                     )
                 )
                 item_index += 1
-                saw_user_text = True
+                saw_user_text = saw_user_text or text.lstrip().startswith("<task-notification>")
+                continue
+            # Claude may emit CLI scaffolding as text blocks; never render it
+            # as user input when the transcript shape changes.
+            stripped = text.lstrip()
+            if "<command-name>" in stripped or any(
+                stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
+            ):
                 continue
             user_blocks.append(
                 {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}
@@ -8376,6 +8610,7 @@ def _user_transcript_items_from_entry(
                     "output": _tool_result_output(entry, block),
                 },
                 response_id=response_id,
+                subagent_return_id=_completed_subagent_tool_id(entry),
             )
         )
         item_index += 1
@@ -8391,6 +8626,11 @@ def _user_transcript_items_from_entry(
                     "content": user_blocks,
                 },
                 response_id=fallback_response_id,
+                agent_message_candidate=all(
+                    isinstance(text := block.get("text"), str)
+                    and _is_agent_notification_text(text)
+                    for block in user_blocks
+                ),
             ),
         )
     return (None if saw_user_text else current_response_id), items
@@ -8663,22 +8903,35 @@ def _assistant_message_item(
         text.
     :returns: Parsed transcript item.
     """
-    display_text = text
-    stripped = text.strip()
-    if _CONTEXT_OVERFLOW_RE.match(stripped):
-        display_text = _CONTEXT_OVERFLOW_REPLACEMENT
-    elif is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        display_text = f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",
         data={
             "role": "assistant",
             "agent": agent_name,
-            "content": [{"type": "output_text", "text": display_text}],
+            "content": [
+                {"type": "output_text", "text": _display_text(text, is_api_error=is_api_error)}
+            ],
         },
         response_id=response_id,
     )
+
+
+def _display_text(text: str, *, is_api_error: bool) -> str:
+    """
+    Rewrite Claude text whose own remedy is a dead end in the web chat.
+
+    :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
+    :param is_api_error: Whether Claude Code authored the text as its own
+        error; gates the ``/login`` guidance append.
+    :returns: The text to show, e.g. the context-overflow guidance.
+    """
+    stripped = text.strip()
+    if _CONTEXT_OVERFLOW_RE.match(stripped):
+        return _CONTEXT_OVERFLOW_REPLACEMENT
+    if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
+        return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
+    return text
 
 
 def _stripped_image_placeholder(source: _JsonObject) -> str:
@@ -8726,6 +8979,15 @@ def _strip_inline_image_data(value: object) -> object:
             return {"type": "text", "text": _stripped_image_placeholder(source)}
         return {key: _strip_inline_image_data(val) for key, val in value.items()}
     return value
+
+
+def _completed_subagent_tool_id(entry: _JsonObject) -> str | None:
+    """Read a synchronous Agent result's native identity, excluding launch handles."""
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict) or result.get("status") != "completed":
+        return None
+    agent_id = result.get("agentId")
+    return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
 def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
