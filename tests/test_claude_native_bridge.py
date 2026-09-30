@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -1258,6 +1259,151 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
         "is_meta": True,
         "content": [{"type": "input_text", "text": task_notification}],
     }
+
+
+_TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-message>'
+_TASK_COMPLETION = (
+    "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"
+)
+
+
+def _read_native_user(
+    tmp_path: Path, content: Any, *, queued: str | None = None, **metadata: Any
+) -> tuple[int, str | None, list[Any]]:
+    entry = (
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": queued,
+                "prompt": content,
+                **metadata,
+            },
+        }
+        if queued
+        else {"type": "user", "message": {"role": "user", "content": content}, **metadata}
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+    return read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    "text,candidate",
+    [
+        (_TEAMMATE_MESSAGE, True),
+        ('<agent-message from="reviewer">Done</agent-message>', True),
+        (_TEAMMATE_MESSAGE + _TEAMMATE_MESSAGE, True),
+        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, True),
+        ("A peer session sent a message while you were working:\n" + _TEAMMATE_MESSAGE, True),
+        (
+            "Another Claude session sent a message while you were working:\n" + _TEAMMATE_MESSAGE,
+            True,
+        ),
+        (
+            "Another Claude session sent a message:\n"
+            + _TEAMMATE_MESSAGE
+            + "\nThis came from another Claude session — not typed by your user, "
+            "but working on their behalf.",
+            True,
+        ),
+        ("Explain this: " + _TEAMMATE_MESSAGE, False),
+        (_TEAMMATE_MESSAGE + "\nWhat does this mean?", False),
+        ("```xml\n" + _TEAMMATE_MESSAGE + "\n```", False),
+    ],
+)
+def test_team_markup_needs_provenance(
+    tmp_path: Path, text: str, candidate: bool, as_blocks: bool
+) -> None:
+    content = [{"type": "text", "text": text}] if as_blocks else text
+    _, _, items = _read_native_user(tmp_path, content)
+    [item] = items
+    assert item.agent_message_candidate is candidate
+    assert item.data == {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+    _, response_id, peers = _read_native_user(tmp_path, content, origin={"kind": "peer"})
+    assert all(peer.data.get("is_meta") for peer in peers)
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize(
+    "queued,text,metadata",
+    [
+        ("prompt", _TEAMMATE_MESSAGE, {"isMeta": True}),
+        ("prompt", _TEAMMATE_MESSAGE, {"origin": {"kind": "peer"}}),
+        ("prompt", "<task-notification><task-id>task-1</task-id></task-notification>", {}),
+        (
+            None,
+            "<task-notification><status>completed</status></task-notification>",
+            {"isMeta": True},
+        ),
+        (
+            None,
+            "<task-notification><task-id>agent-1</task-id><status>completed</status>",
+            {"isMeta": True},
+        ),
+    ],
+)
+def test_internal_scaffolding_does_not_split_parent_response(
+    tmp_path: Path, queued: str | None, text: str, metadata: dict[str, Any]
+) -> None:
+    _, response_id, items = _read_native_user(tmp_path, text, queued=queued, **metadata)
+    assert items == []
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])
+@pytest.mark.parametrize("handback", [False, True])
+def test_completion_preserves_hidden_provenance(
+    tmp_path: Path, queued: str | None, handback: bool
+) -> None:
+    origin = {"kind": "peer", "handback": True, "senderTaskId": "agent-1"} if handback else None
+    text = _TEAMMATE_MESSAGE if handback else _TASK_COMPLETION
+    _, response_id, items = _read_native_user(
+        tmp_path, text, queued=queued, isMeta=True, origin=origin
+    )
+    [item] = items
+    assert item.data["is_meta"] is True
+    assert item.subagent_return_id == ("agent-1" if handback else None)
+    if queued or handback:
+        assert response_id == "active"
+
+
+@pytest.mark.parametrize("internal", [False, True])
+def test_mixed_native_blocks_keep_human_text_and_hide_completion_guidance(
+    tmp_path: Path, internal: bool
+) -> None:
+    text = "Internal guidance" if internal else "Explain the message format"
+    content = [
+        {"type": "text", "text": _TASK_COMPLETION if internal else _TEAMMATE_MESSAGE},
+        {"type": "text", "text": text},
+    ]
+    _, _, items = _read_native_user(tmp_path, content, isMeta=internal)
+    if internal:
+        assert len(items) == 2
+        assert all(item.data.get("is_meta") for item in items)
+    else:
+        [item] = items
+        assert not item.agent_message_candidate
+        assert [block["text"] for block in item.data["content"]] == [_TEAMMATE_MESSAGE, text]
+
+
+@pytest.mark.parametrize("status", ["completed", "async_launched"])
+def test_native_agent_tool_result_carries_only_completion_provenance(
+    tmp_path: Path, status: str
+) -> None:
+    _, response_id, items = _read_native_user(
+        tmp_path,
+        [{"type": "tool_result", "tool_use_id": "tool-1", "content": "Result text"}],
+        toolUseResult={"agentId": "agent-1", "status": status},
+    )
+    [item] = items
+    assert item.subagent_return_id == ("agent-1" if status == "completed" else None)
+    assert item.data == {"call_id": "tool-1", "output": "Result text"}
+    assert response_id == "active"
 
 
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
@@ -3219,6 +3365,52 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # elicitation card (question answers ride back via ``updatedInput``),
     # so the wrapper must not inject a ``--disallowedTools`` flag of its own.
     assert "--disallowedTools" not in args
+
+
+def test_generated_claude_subprocesses_pin_runner_tmpdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP and Python hooks use the temp root that created the bridge."""
+    runner_tmpdir = tmp_path / "runner-tmp"
+    bridge_dir = (
+        runner_tmpdir
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+        / "session"
+    )
+    bridge_dir.mkdir(parents=True)
+    inherited_tmpdir = tmp_path / "shell-tmp"
+    inherited_tmpdir.mkdir()
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
+        runner_tmpdir,
+    )
+    monkeypatch.setenv("TMPDIR", str(inherited_tmpdir))
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787",
+        subagent_router_dir=bridge_dir,
+        turn_routing=True,
+    )
+    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    settings = _load_invocation_settings(args)
+
+    server_env = mcp_config["mcpServers"]["omnigent"]["env"]
+    assert server_env["TMPDIR"] == str(runner_tmpdir)
+    python_commands = [
+        hook["command"]
+        for entries in settings["hooks"].values()
+        for entry in entries
+        for hook in entry["hooks"]
+        if "/venv/bin/python" in hook["command"]
+    ]
+    assert len(python_commands) == 18
+    expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
+    assert all(expected_tmpdir in command for command in python_commands)
 
 
 def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
@@ -5805,8 +5997,10 @@ def test_post_tools_changed_preserves_programming_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("result_kind", ["text", "images", "image_error"])
 @pytest.mark.parametrize("cancellable", [False, True])
 async def test_channel_server_relays_active_omnigent_tools(
+    result_kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subprocess_bridge_root: Path,
@@ -5841,8 +6035,25 @@ async def test_channel_server_relays_active_omnigent_tools(
         text=True,
     )
     calls: list[dict[str, object]] = []
+    from PIL import Image
 
-    async def tool_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+    from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+    from omnigent.util.json_types import JsonObject
+
+    image_blocks: list[JsonObject] = []
+    for color in ("red", "blue"):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        image_blocks.append(
+            {
+                "type": "image",
+                "data": base64.b64encode(buffer.getvalue()).decode(),
+                "mimeType": "image/png",
+            }
+        )
+    image_blocks.append({"type": "text", "text": "After both images: subtract 30; word amber."})
+
+    async def tool_executor(name: str, arguments: dict[str, object]) -> object:
         """
         Capture one relayed tool call.
 
@@ -5852,6 +6063,10 @@ async def test_channel_server_relays_active_omnigent_tools(
         :returns: Structured tool result.
         """
         calls.append({"name": name, "arguments": arguments})
+        if result_kind != "text":
+            return json.loads(
+                encode_mcp_image_result(image_blocks, is_error=result_kind == "image_error")
+            )
         return {"echo": arguments}
 
     relay = None
@@ -5916,8 +6131,14 @@ async def test_channel_server_relays_active_omnigent_tools(
         )
         tool_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
         assert tool_result["id"] == 3
-        text = tool_result["result"]["content"][0]["text"]
-        assert json.loads(text) == {"echo": {"value": "hello"}}
+        if result_kind == "text":
+            text = tool_result["result"]["content"][0]["text"]
+            assert json.loads(text) == {"echo": {"value": "hello"}}
+        else:
+            assert tool_result["result"] == {
+                "content": image_blocks,
+                "isError": result_kind == "image_error",
+            }
         assert calls == [{"name": "sys_custom", "arguments": {"value": "hello"}}]
     finally:
         if relay is not None:
@@ -7662,6 +7883,64 @@ def test_hook_record_todo_write_with_non_list_todos_gives_none() -> None:
     assert record.todos is None
 
 
+def test_hook_record_parses_stop_failure_reason() -> None:
+    """``StopFailure`` keeps its error category and rendered error text."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": " server_error ",
+                "last_assistant_message": "API Error: 500 " + "x" * 5000,
+            }
+        )
+    )
+    assert record.failure_category == "server_error"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("API Error: 500 x")
+    assert len(record.failure_message) == 4000
+
+
+def test_hook_record_failure_fields_none_when_blank_or_not_stop_failure() -> None:
+    """Blank, non-string, or non-``StopFailure`` fields are not a failure reason."""
+    blank = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "error": "  ", "last_assistant_message": 7}
+        )
+    )
+    assert blank.failure_category is None
+    assert blank.failure_message is None
+    stop = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "Stop", "error": "rate_limit", "last_assistant_message": "done"}
+        )
+    )
+    assert stop.failure_category is None
+    assert stop.failure_message is None
+
+
+def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
+    """The failure card rewrites dead-end CLI remedies like the mirrored message."""
+    overflow = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "last_assistant_message": "Prompt is too long"}
+        )
+    )
+    assert overflow.failure_message is not None
+    assert overflow.failure_message.startswith("Context limit reached")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "last_assistant_message": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" in login.failure_message
+
+
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────
 
 
@@ -8913,6 +9192,67 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
         "/tmp/example/tmux.sock",
         "claude:0.0",
         timeout_s=0.0,
+    )
+
+
+_SIGN_IN_PANE = (
+    "dbexec: launcher 1.2.3\n"
+    "Logging in via SSO...\n"
+    "If the browser does not open automatically, please open the following URL:\n"
+    "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+)
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher sign-in prompt holding the pane fails delivery within a poll
+    interval, carrying the address as the next step, instead of waiting out
+    the budget and reaping the pane the person needs to finish signing in.
+    """
+    captures: list[bool] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(join_wrapped)
+        return _SIGN_IN_PANE
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Claude Code can't start until you sign in to Databricks"
+    # The one-time address stays out of the error text; the card fetches the
+    # live link from the host when clicked.
+    assert "http" not in raised.value.remediation
+    assert raised.value.remediation.startswith(
+        "Open the sign-in link and sign in. Claude Code continues on its own"
+    )
+    # Two plain polls saw the address; each looked again with wrapped rows joined.
+    assert captures == [False, True, False, True]
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An address left in scrollback is not a sign-in gate once the input box is up."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: _SIGN_IN_PANE + _READY_PANE,
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
     )
 
 
