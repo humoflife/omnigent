@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -23,19 +24,21 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.kiro_native import main as kiro_native
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+from tests.runner.native_helpers import _harness_spec
 
 
 class _EventRecordingServerClient(NullServerClient):
@@ -145,6 +148,7 @@ class _RecordingCodexAppServerClient:
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     event_payload: dict[str, Any],
     expected_params: dict[str, Any],
 ) -> None:
@@ -158,7 +162,6 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     no active turn id is recorded.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "524fe55f9d5a7f66fec5c5401a930b84"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -203,26 +206,9 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         _fake_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "codex-native", "model": "gpt-5.4"},
-        ),
-    )
+    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the codex-native spec for any agent_id."""
-        del agent_id, session_id
-        return codex_native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -242,12 +228,670 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     )
     assert fake_client.connected
     assert fake_client.closed
+    if event_payload["type"] == "effort_change":
+        assert "effort change without a known model skips validation" in caplog.text
     assert fake_client.requests == [
         ("thread/settings/update", expected_params),
     ], (
         f"codex-native {event_payload['type']} must call thread/settings/update "
         f"with next-turn settings; got {fake_client.requests!r}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_payload",
+    [
+        {"type": "effort_change", "effort": 5},
+        {"type": "model_change", "model": "gpt-5.4", "effort": ["high"]},
+    ],
+)
+async def test_codex_native_controls_reject_non_string_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_payload: dict[str, Any],
+) -> None:
+    """Both settings controls reject a malformed effort before contacting Codex."""
+    conv_id = "8d1f9a3c2b7e4c5d9a0b1c2d3e4f5a6b"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json=event_payload)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "error": "invalid_input",
+        "detail": "Body 'effort' must be a string or null",
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_native_reset_without_a_current_model_is_rejected_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unsatisfiable native reset is invalid input and must not open a connection."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import NativeControls, build_native_controls
+
+    conv_id = uuid.uuid4().hex
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text('model_reasoning_effort = "xhigh"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=str(tmp_path / "codex.sock"),
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    factory = Mock()
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", factory)
+    remembered_efforts: dict[str, str] = {}
+
+    def capture_controls(**kwargs: Any) -> NativeControls:
+        nonlocal remembered_efforts
+        remembered_efforts = kwargs["_session_reasoning_effort"]
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", capture_controls)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        remembered_efforts[conv_id] = "xhigh"
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": None}
+        )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_input"
+    assert "requires a current model" in response.json()["detail"]
+    factory.assert_not_called()
+    assert remembered_efforts[conv_id] == "xhigh"
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == "xhigh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stalled", ["connect", "update"])
+async def test_codex_native_settings_update_times_out_and_releases_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stalled: str,
+) -> None:
+    """A hung connect is refused (503) and a hung update is unconfirmed (504); neither blocks."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import turn_routing
+
+    conv_id = "1f2e3d4c5b6a49788796a5b4c3d2e1f0"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    stall = {"active": True}
+
+    class _StallingClient(_RecordingCodexAppServerClient):
+        async def connect(self) -> None:
+            if stalled == "connect" and stall["active"]:
+                await asyncio.Event().wait()
+            await super().connect()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if stalled == "update" and method == "thread/settings/update" and stall["active"]:
+                await asyncio.Event().wait()
+            return await super().request(method, params)
+
+    clients: list[_StallingClient] = []
+
+    def _fake_client_for_transport(
+        transport: str, *, client_name: str = "omnigent"
+    ) -> _StallingClient:
+        clients.append(_StallingClient(transport=transport, client_name=client_name))
+        return clients[-1]
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", _fake_client_for_transport
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stalled_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high", "rollback_on_refusal": True},
+        )
+        stall["active"] = False
+        next_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "low"}
+        )
+
+    # A stalled update may still apply, so it is unconfirmed rather than refused.
+    assert stalled_resp.status_code == (504 if stalled == "update" else 503), stalled_resp.text
+    assert next_resp.status_code == 204, next_resp.text
+    assert all(stalled_client.closed for stalled_client in clients)
+    assert clients[-1].requests == [
+        ("thread/settings/update", {"threadId": "thread_codex", "effort": "low"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_native_late_settings_ack_still_reaches_an_older_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A server without timeout negotiation gets a late confirmation, not an early 504."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import native_controls, turn_routing
+
+    conv_id = uuid.uuid4().hex
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text('model = "gpt-6-sol"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=str(tmp_path / "codex.sock"),
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_LEGACY_SERVER_UPDATE_TIMEOUT_S", 5.0)
+    acknowledge = asyncio.Event()
+
+    class LateClient(_RecordingCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "thread/settings/update":
+                await acknowledge.wait()
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        lambda transport, **kwargs: LateClient(transport, "late-ack"),
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-6-sol"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        switch = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "gpt-5.4"},
+            )
+        )
+        try:
+            done, _ = await asyncio.wait({switch}, timeout=0.3)
+            assert not done, "an older server must not receive an unconfirmed timeout"
+        finally:
+            acknowledge.set()
+        response = await asyncio.wait_for(switch, timeout=2)
+
+    assert response.status_code == 204, response.text
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mirror_recovers", "expected_config_effort"),
+    [
+        pytest.param(False, "medium", id="write_still_failing"),
+        pytest.param(True, "xhigh", id="write_retried"),
+    ],
+)
+async def test_codex_native_model_switch_inherits_an_effort_whose_config_write_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mirror_recovers: bool,
+    expected_config_effort: str,
+) -> None:
+    """A model-only switch keeps the applied effort even when the config still has the old one."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-6-sol"\nmodel_reasoning_effort = "medium"\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": model,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value} for value in levels
+                        ],
+                    }
+                    for model, levels in [
+                        ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                        ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max"]),
+                    ]
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: fake)
+    write_effort = codex_native_bridge.write_codex_config_effort
+    mirror = {"works": False}
+
+    def flaky_write_effort(bridge_dir: Path, effort: str) -> bool:
+        return mirror["works"] and write_effort(bridge_dir, effort)
+
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", flaky_write_effort)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-6-sol"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        picked = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "max"}
+        )
+        assert picked.status_code == 204, picked.text
+        assert codex_native_bridge.read_codex_config_effort(bridge_dir) == "medium"
+        mirror["works"] = mirror_recovers
+        switched = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "model_change", "model": "gpt-5.4"}
+        )
+        assert switched.status_code == 204, switched.text
+
+    updates = [params for method, params in fake.requests if method == "thread/settings/update"]
+    assert updates[-1] == {"threadId": "thread_codex", "model": "gpt-5.4", "effort": "xhigh"}
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == expected_config_effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_model", "initial_effort", "event", "expected_model", "expected_effort"),
+    [
+        ("gpt-6-sol", "max", {"type": "model_change", "model": "gpt-5.4"}, "gpt-5.4", "xhigh"),
+        ("gpt-5.4", "medium", {"type": "effort_change", "effort": "minimal"}, "gpt-5.4", "low"),
+        ("gpt-6-sol", "medium", {"type": "effort_change", "effort": "max"}, "gpt-6-sol", "max"),
+        ("gpt-5.4", None, {"type": "model_change", "model": "glm-5-2"}, "glm-5-2", "medium"),
+        pytest.param(
+            "gpt-5.4",
+            "high",
+            {"type": "model_change", "model": "gpt-6-sol"},
+            "gpt-6-sol",
+            "high",
+            id="inherited_supported_effort",
+        ),
+        pytest.param(
+            "gpt-5.4",
+            "xhigh",
+            {"type": "effort_change", "effort": None},
+            "gpt-5.4",
+            "medium",
+            id="effort_reset",
+        ),
+        pytest.param(
+            "gpt-5.4",
+            "xhigh",
+            {"model": "glm-5-2", "effort": None},
+            "glm-5-2",
+            "high",
+            id="model_change_and_effort_reset",
+        ),
+    ],
+)
+async def test_codex_native_settings_change_clamps_and_mirrors_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    initial_model: str,
+    initial_effort: str | None,
+    event: dict[str, Any],
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    """Immediate picker updates validate inherited effort and save the applied settings."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import NativeControls, build_native_controls
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        f'model = "{initial_model}"\n'
+        + (f'model_reasoning_effort = "{initial_effort}"\n' if initial_effort else "")
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": model,
+                        "defaultReasoningEffort": "high" if model == "glm-5-2" else "medium",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value} for value in levels
+                        ],
+                    }
+                    for model, levels in [
+                        ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                        ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+                        ("glm-5-2", ["low", "medium", "high"]),
+                    ]
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: fake)
+    controls: NativeControls | None = None
+    remembered_efforts: dict[str, str] = {}
+
+    def capture_controls(**kwargs: Any) -> NativeControls:
+        nonlocal controls, remembered_efforts
+        remembered_efforts = kwargs["_session_reasoning_effort"]
+        controls = build_native_controls(**kwargs)
+        return controls
+
+    monkeypatch.setattr(runner_app, "build_native_controls", capture_controls)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model=initial_model))
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert create.status_code == 201, create.text
+        if initial_effort is not None:
+            # A terminal-side pick can leave the runner's remembered choice stale.
+            remembered_efforts[conv_id] = "minimal"
+        repetitions = 2 if event == {"type": "effort_change", "effort": "minimal"} else 1
+        for _ in range(repetitions):
+            if "type" in event:
+                response = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+                assert response.status_code == 204, response.text
+            else:
+                assert controls is not None
+                result = await controls.handle_codex_native_settings_update(conv_id, event)
+                assert result.status_code == 204
+    updates = [params for method, params in fake.requests if method == "thread/settings/update"]
+    assert len(updates) == repetitions
+    assert all(params["effort"] == expected_effort for params in updates)
+    assert sum(method == "model/list" for method, _ in fake.requests) == 1
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_model
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == expected_effort
+    assert remembered_efforts.get(conv_id) == expected_effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "mirror_recovers",
+        "terminal_model",
+        "plan_toggle",
+        "expected_effort",
+        "expected_config_model",
+    ),
+    [
+        pytest.param(False, None, False, "max", "gpt-5.4", id="mirror_still_failing"),
+        pytest.param(True, None, False, "max", "gpt-6-sol", id="mirror_retried"),
+        pytest.param(True, "gpt-5.5", False, "high", "gpt-5.5", id="terminal_switched_model"),
+        pytest.param(True, "gpt-5.4", False, "xhigh", "gpt-5.4", id="terminal_switched_back"),
+        pytest.param(
+            False, "gpt-5.5", True, "high", "gpt-5.5", id="terminal_switched_then_plan_toggled"
+        ),
+    ],
+)
+async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mirror_recovers: bool,
+    terminal_model: str | None,
+    plan_toggle: bool,
+    expected_effort: str,
+    expected_config_model: str,
+) -> None:
+    """A stale config model must not decide which efforts the applied model accepts."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    config = codex_home / "config.toml"
+    config.write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "medium"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": model,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value} for value in levels
+                        ],
+                    }
+                    for model, levels in [
+                        ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                        ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max"]),
+                        ("gpt-5.5", ["low", "medium", "high"]),
+                    ]
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: fake)
+    write_model = codex_native_bridge.write_codex_config_model
+    mirror = {"works": False}
+
+    def flaky_write_model(bridge_dir: Path, model: str) -> bool:
+        return mirror["works"] and write_model(bridge_dir, model)
+
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", flaky_write_model)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert create.status_code == 201, create.text
+        switched = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "gpt-6-sol"},
+        )
+        assert switched.status_code == 204, switched.text
+        assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.4"
+        mirror["works"] = mirror_recovers
+        if terminal_model is not None:
+            # A later in-terminal /model replaces the config, even with the original model.
+            rewritten = config.with_name("config.toml.terminal")
+            rewritten.write_text(config.read_text().replace('"gpt-5.4"', f'"{terminal_model}"'))
+            os.replace(rewritten, config)
+        if plan_toggle:
+            # A settings update without a model or effort must not revive the stale model.
+            toggled = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "plan_mode_change", "enabled": True},
+            )
+            assert toggled.status_code == 204, toggled.text
+        picked = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "max"}
+        )
+        assert picked.status_code == 204, picked.text
+    updates = [params for method, params in fake.requests if method == "thread/settings/update"]
+    assert updates[-1] == {"threadId": "thread_codex", "effort": expected_effort}
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_config_model
+
+
+@pytest.mark.asyncio
+async def test_codex_native_concurrent_settings_use_the_applied_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An effort pick waits for an overlapping model switch to finish mirroring."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-6-sol"\nmodel_reasoning_effort = "max"\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    applied_model = asyncio.Event()
+    release_first_close = asyncio.Event()
+    native_settings = {"model": "gpt-6-sol", "effort": "max"}
+    updates: list[dict[str, Any]] = []
+    clients: list[_RecordingCodexAppServerClient] = []
+
+    class ConcurrentClient(_RecordingCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "model/list":
+                return {
+                    "result": {
+                        "data": [
+                            {
+                                "id": model,
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": level} for level in levels
+                                ],
+                            }
+                            for model, levels in [
+                                ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                                ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max"]),
+                            ]
+                        ]
+                    }
+                }
+            assert method == "thread/settings/update"
+            updates.append(params)
+            native_settings.update({k: v for k, v in params.items() if k != "threadId"})
+            if "model" in params:
+                applied_model.set()
+            return {"result": {}}
+
+        async def close(self) -> None:
+            if self is clients[0]:
+                await release_first_close.wait()
+            await super().close()
+
+    def make_client(*args: object, **kwargs: object) -> ConcurrentClient:
+        result = ConcurrentClient(transport, "effort-test")
+        clients.append(result)
+        return result
+
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", make_client)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-6-sol"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "gpt-5.4"},
+            )
+        )
+        second: asyncio.Task[Any] | None = None
+        try:
+            await asyncio.wait_for(applied_model.wait(), timeout=2)
+            second = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={"type": "effort_change", "effort": "max"},
+                )
+            )
+            await asyncio.wait({second}, timeout=0.1)
+        finally:
+            release_first_close.set()
+            tasks = [first, *([second] if second is not None else [])]
+            responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+        assert all(response.status_code == 204 for response in responses)
+    assert updates == [
+        {"threadId": "thread_codex", "model": "gpt-5.4", "effort": "xhigh"},
+        {"threadId": "thread_codex", "effort": "xhigh"},
+    ]
+    assert native_settings == {"model": "gpt-5.4", "effort": "xhigh"}
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.4"
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -304,18 +948,7 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
         codex_native_app_server, "client_for_transport", _fake_client_for_transport
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "codex-native", "model": "gpt-5.4"},
-        ),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return codex_native_spec
+    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
 
     async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
         # Stands in for the auto-create-terminal path, which needs a real
@@ -327,12 +960,7 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
         "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
     )
 
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -399,18 +1027,7 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
         ),
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "codex-native", "model": "gpt-5.4"},
-        ),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return codex_native_spec
+    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
 
     async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -419,12 +1036,7 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
     )
 
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -453,30 +1065,13 @@ async def test_events_codex_native_model_change_without_bridge_fails_loud(
     claim a switch the app-server never saw — the server surfaces the 503
     as the visible not-applied error instead.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "624fe55f9d5a7f66fec5c5401a930b85"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "codex-native", "model": "gpt-5.4"},
-        ),
-    )
+    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return codex_native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -506,21 +1101,9 @@ async def test_kiro_native_model_options_use_cli_catalog(
         }
     ]
     monkeypatch.setattr(kiro_native, "list_kiro_cli_model_options", lambda: expected)
-    spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    spec = _harness_spec("kiro-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(spec)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -544,21 +1127,9 @@ async def test_kiro_native_model_options_failure_is_retryable(
         raise RuntimeError("catalog unavailable")
 
     monkeypatch.setattr(kiro_native, "list_kiro_cli_model_options", _fail_discovery)
-    spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    spec = _harness_spec("kiro-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(spec)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -598,21 +1169,9 @@ async def test_cursor_native_model_options_use_cli_catalog(
         injected.append((model, expected_display_name))
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _inject_model)
-    spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    spec = _harness_spec("cursor-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(spec)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -653,21 +1212,9 @@ async def test_cursor_native_model_options_failure_is_retryable(
         raise RuntimeError("catalog unavailable")
 
     monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", _fail_discovery)
-    spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    spec = _harness_spec("cursor-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(spec)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -688,7 +1235,6 @@ async def test_opencode_native_model_options_uses_cli_catalog(
     from omnigent.harnesses.opencode_native import app_server as opencode_native_app_server
     from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
     from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "conv_opencode_native_model_options"
     monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path)
@@ -712,21 +1258,9 @@ async def test_opencode_native_model_options_uses_cli_catalog(
         "list_opencode_cli_model_options",
         _fake_list_options,
     )
-    spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
-    )
+    spec = _harness_spec("opencode-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(spec)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -841,22 +1375,9 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
         _client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the codex-native spec for any agent_id."""
-        del agent_id, session_id
-        return codex_native_spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -902,7 +1423,6 @@ async def test_codex_native_model_options_query_model_list(
     the pane launched on — wins when the list offers it.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.spec.types import ExecutorSpec
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(
@@ -1021,22 +1541,9 @@ async def test_codex_native_model_options_query_model_list(
         _fake_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the codex-native spec for any agent_id."""
-        del agent_id, session_id
-        return codex_native_spec
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1115,8 +1622,12 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
         return spec
 
     def resolve_launch(
-        *, model: str | None, spec: AgentSpec | None = None
+        *,
+        model: str | None,
+        spec: AgentSpec | None = None,
+        terminal_launch_args: Sequence[str] = (),
     ) -> codex.NativeCodexLaunch:
+        del terminal_launch_args
         if case == "invalid-config":
             raise RuntimeError("provider configuration unavailable")
         selected = spec.executor.auth.profile if spec is not None else "default"
@@ -1258,15 +1769,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
     conv_id = "6a416804870ed618cc8908f5cebab937"
-    claude_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return claude_spec
+    claude_spec = _harness_spec("claude-native")
 
     config = ClaudeNativeUcodeConfig(
         env={
@@ -1336,11 +1839,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(claude_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1399,15 +1898,7 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
     conv_id = "7b527915981fe729dd9a19a6dfcbc048"
-    claude_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return claude_spec
+    claude_spec = _harness_spec("claude-native")
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
@@ -1458,11 +1949,7 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(claude_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1494,7 +1981,6 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     expiring — the second read joins it instead of restarting it.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
-    from omnigent.runner import app as runner_app_module
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(
@@ -1502,15 +1988,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     )
 
     conv_id = "9c527915981fe729dd9a19a6dfcbca49"
-    claude_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return claude_spec
+    claude_spec = _harness_spec("claude-native")
 
     config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-10"},
@@ -1541,7 +2019,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.probe_claude_model_options", _slow_probe
     )
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
+    monkeypatch.setattr(model_option_routes, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1566,11 +2044,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(claude_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1585,7 +2059,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         # The 0.01s wait above exists only to make the first read time out.
         # Keep it that tight here and a loaded machine answers 503 again
         # before the woken probe is even scheduled.
-        monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
+        monkeypatch.setattr(model_option_routes, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
         resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
         cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
 
@@ -1626,15 +2100,7 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     conv_id = "7b527915981fe729dd9a19a6dfcbca48"
-    claude_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return claude_spec
+    claude_spec = _harness_spec("claude-native")
 
     def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
         del spec
@@ -1662,11 +2128,7 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(claude_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1705,17 +2167,11 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
-    monkeypatch.setattr("omnigent.runner.app._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0)
-    conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
-    claude_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    monkeypatch.setattr(
+        "omnigent.runner.model_option_routes._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0
     )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return claude_spec
+    conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
+    claude_spec = _harness_spec("claude-native")
 
     config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-10"},
@@ -1763,11 +2219,7 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(claude_spec)
     refreshed = [
         {
             "id": "opus",
@@ -1818,15 +2270,7 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
     conv_id = "9d2e3f4a5b6c47d8e9f0a1b2c3d4e5f6"
-    claude_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return claude_spec
+    claude_spec = _harness_spec("claude-native")
 
     def _config(model: str) -> ClaudeNativeUcodeConfig:
         return ClaudeNativeUcodeConfig(
@@ -1872,11 +2316,7 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
     )
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(claude_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1909,32 +2349,9 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
     conv_id = "290b63ecec11a7ae5b93da19be2d9195"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "codex-native", "model": "gpt-5.4"},
-        ),
-    )
+    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """
-        Return the codex-native spec for any agent id.
-
-        :param agent_id: Agent identifier, e.g. ``"880b5afda28ad55ff74cbeb9b5fc67fb"``.
-        :param session_id: Session identifier, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
-        :returns: Codex-native agent spec.
-        """
-        del agent_id, session_id
-        return codex_native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1976,7 +2393,6 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner.app import _session_histories_ref
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "83d1472d16e3e635c84ca44f29624fca"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -2021,11 +2437,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         _fake_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the codex-native spec for any agent_id."""
@@ -2145,11 +2557,7 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     monkeypatch.setattr(
         codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
     )
-    spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    spec = _harness_spec("codex-native")
 
     async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         return spec
@@ -2216,7 +2624,6 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner.app import _session_histories_ref
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "fa87fda193a47e99e6a2599e44032807"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -2261,11 +2668,7 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
         _fake_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the codex-native spec for any agent_id."""
@@ -2362,7 +2765,6 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     id — instead of doing nothing.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = f"36ea25fd09df4a2d85136100fbecd3e9{event_type}"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -2420,11 +2822,7 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
         _fake_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the codex-native spec for any agent_id."""
@@ -2498,7 +2896,6 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     flip the bridge's pending servers to ``cancelled``.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "14fb6a0dde97fc0f7a58a84e1be2c538"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -2554,11 +2951,7 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
         _fake_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the codex-native spec for any agent_id."""
@@ -2613,7 +3006,6 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     requests to the app-server on every Stop press.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "5cb0fd92163581dee07e5462a93d5021"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -2656,11 +3048,7 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
         _fail_client_for_transport,
     )
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the codex-native spec for any agent_id."""
@@ -2719,16 +3107,11 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.runner.app import _session_histories_ref
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = uuid.uuid4().hex
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
 
-    pi_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
-    )
+    pi_native_spec = _harness_spec("pi-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the pi-native spec for any agent_id."""
@@ -2821,16 +3204,11 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     import json as _json
 
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "conv_pi_native_model_change"
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
 
-    pi_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
-    )
+    pi_native_spec = _harness_spec("pi-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -2926,7 +3304,6 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
        be the interrupt handler leaking into the stop path.
     """
     from omnigent.runner.app import _session_event_queues_ref, _session_histories_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured_kill: list[Any] = []
 
@@ -2936,23 +3313,9 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
 
     monkeypatch.setattr(claude_native_bridge, "kill_session", _fake_kill)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -3043,8 +3406,6 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
     Pre-fix the kill happened but the entry was never reclaimed (the parent could
     hang thinking the worker was still running).
     """
-    from omnigent.runner import app as runner_app
-    from omnigent.spec.types import ExecutorSpec
 
     parent_id = "c4315225d4a12d320df065ed1ac8baad"
     worker_id = "8dcfd4c64c7a29cddaefa4af686da1da"
@@ -3052,25 +3413,12 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
 
     monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *a, **k: None)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return native_spec
+    app, _ = await _build_app_for_spec(native_spec)
 
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=worker_id,
         agent="claude_code",
@@ -3090,8 +3438,8 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
             )
             assert stop_resp.status_code == 204, stop_resp.text
     finally:
-        runner_app.unregister_subagent_work(worker_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(worker_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # The killed worker's entry was reclaimed: a single cancelled completion
     # landed in the parent's inbox. If 0, the stop path killed the pane but
@@ -3117,38 +3465,16 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
     204 so Omnigent can finish host-runner teardown and write the deliberate-stop
     label even if parent delivery cannot be confirmed.
     """
-    from omnigent.runner import app as runner_app
-    from omnigent.spec.types import ExecutorSpec
 
     parent_id = "a87dd01585f0c6f0f82f73d74e4124c0"
     worker_id = "d2af8cd6293253c5937d8c7d35fb3d6b"
 
     monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *a, **k: None)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """
-        Resolve every test session to a claude-native spec.
-
-        :param agent_id: Agent id requested by the runner.
-        :param session_id: Optional session id being spawned.
-        :returns: Native executor spec for the test.
-        """
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    runner_app.register_subagent_work(
+    app, _ = await _build_app_for_spec(native_spec)
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=worker_id,
         agent="claude_code",
@@ -3166,9 +3492,9 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
                 f"/v1/sessions/{worker_id}/events",
                 json={"type": "stop_session"},
             )
-        entry = runner_app.get_subagent_work(worker_id)
+        entry = subagent_work.get_subagent_work(worker_id)
     finally:
-        runner_app.unregister_subagent_work(worker_id)
+        subagent_work.unregister_subagent_work(worker_id)
 
     assert stop_resp.status_code == 204, stop_resp.text
     assert entry is not None
@@ -3193,7 +3519,6 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
     that says "stopped" while the session may still be alive.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
         """Simulate the bridge-not-ready path."""
@@ -3202,23 +3527,9 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
 
     monkeypatch.setattr(claude_native_bridge, "kill_session", _fake_kill)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -3294,17 +3605,7 @@ async def test_events_stop_session_on_non_native_session_is_204_noop(
         executor=ExecutorSpec(type="omnigent", config={}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the default spec for any agent_id."""
-        del agent_id
-        return default_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(default_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -3345,7 +3646,6 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
     publish ``session.resource.deleted`` so connected clients drop them.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
     from tests.runner.helpers import make_test_terminal_instance
 
     def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
@@ -3365,24 +3665,9 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        terminal_registry=terminal_registry,
-    )
+    app, _ = await _build_app_for_spec(native_spec, terminal_registry=terminal_registry)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -3446,7 +3731,6 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     :param caplog: Captures the attributed failure log row.
     """
     caplog.set_level(logging.ERROR, logger="omnigent.runner.app")
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -3485,15 +3769,15 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
         terminal_registry=terminal_registry,
     )
     resource_registry = app.state.session_resource_registry
-    runner_app._session_inboxes_ref[parent_id] = parent_inbox
-    runner_app.register_child_session(
+    subagent_work._session_inboxes_ref[parent_id] = parent_inbox
+    subagent_work.register_child_session(
         conv_id,
         parent_session_id=parent_id,
         title="worker:main",
         tool="worker",
         session_name="main",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=conv_id,
         agent="worker",
@@ -3531,9 +3815,9 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
-        runner_app.unregister_subagent_work(conv_id)
-        runner_app.unregister_child_session(conv_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(conv_id)
+        subagent_work.unregister_child_session(conv_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert terminal_registry.get(conv_id, "worker", "main") is None
     assert {
@@ -3683,7 +3967,6 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
     :param tmp_path: Temporary directory for fake terminal paths.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -3719,15 +4002,15 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         terminal_registry=terminal_registry,
     )
     resource_registry = app.state.session_resource_registry
-    runner_app._session_inboxes_ref[parent_id] = parent_inbox
-    runner_app.register_child_session(
+    subagent_work._session_inboxes_ref[parent_id] = parent_inbox
+    subagent_work.register_child_session(
         conv_id,
         parent_session_id=parent_id,
         title="worker:main",
         tool="worker",
         session_name="main",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=conv_id,
         agent="worker",
@@ -3769,9 +4052,9 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
-        runner_app.unregister_subagent_work(conv_id)
-        runner_app.unregister_child_session(conv_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(conv_id)
+        subagent_work.unregister_child_session(conv_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # The terminal resource is still removed...
     assert terminal_registry.get(conv_id, "worker", "main") is None
@@ -3858,7 +4141,6 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
 
     :param terminal_name: The native terminal that the user quit cleanly.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -3901,7 +4183,7 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     # The terminal resource is removed and a final idle clears the spinner...
     assert {
@@ -3932,7 +4214,6 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
     must detect the banner and treat the exit as a clean stop: publish idle,
     release the harness, and never render a red required_terminal_exited card.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -3978,7 +4259,7 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     # The terminal resource is removed and a final idle clears the spinner.
     assert {
@@ -4013,7 +4294,6 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
     """
     import logging
 
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -4055,7 +4335,7 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
                 await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     assert {
         "type": "session.resource.deleted",
@@ -4085,7 +4365,6 @@ async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
     The voluntary-exit banner check is scoped to terminal_name=="claude". Another
     CLI printing similar text with exit 0 must not bypass the failure path.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -4126,7 +4405,7 @@ async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     # Non-claude terminal: the banner does not suppress the failure card.
     assert [
@@ -4257,7 +4536,6 @@ async def test_events_effort_change_on_native_session_types_slash_command(
     the dropdown click silently ineffective.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
 
@@ -4274,23 +4552,9 @@ async def test_events_effort_change_on_native_session_types_slash_command(
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         # Seed _session_spec_cache so /events can detect "claude-native".
@@ -4373,7 +4637,6 @@ async def test_events_interrupt_on_kiro_native_routes_to_escape(
     did nothing. This pins that the dispatch routes kiro-native to
     ``kiro_native_bridge.inject_interrupt`` with the snappy 1.0s timeout.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
     monkeypatch.setattr(
@@ -4382,22 +4645,9 @@ async def test_events_interrupt_on_kiro_native_routes_to_escape(
         lambda bridge_dir, *, timeout_s: captured.append((bridge_dir, timeout_s)),
     )
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    native_spec = _harness_spec("kiro-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -4437,7 +4687,6 @@ async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
     ``session.status: idle`` (kiro-cli has no Stop hook on a hard kill).
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
     monkeypatch.setattr(
@@ -4446,22 +4695,9 @@ async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
         lambda bridge_dir, *, timeout_s: captured.append((bridge_dir, timeout_s)),
     )
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    native_spec = _harness_spec("kiro-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -4512,7 +4748,6 @@ async def test_events_interrupt_on_kiro_native_503_skips_idle_when_inject_fails(
     against a reorder that moves the idle publish ahead of the ``try``.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(bridge_dir: Any, *, timeout_s: float) -> None:
         """Simulate the bridge-not-ready path."""
@@ -4521,22 +4756,9 @@ async def test_events_interrupt_on_kiro_native_503_skips_idle_when_inject_fails(
 
     monkeypatch.setattr(kiro_native_bridge, "inject_interrupt", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    native_spec = _harness_spec("kiro-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -4585,7 +4807,6 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
     while the ``kiro-cli`` process may still be alive.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
         """Simulate the bridge-not-ready path."""
@@ -4594,22 +4815,9 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 
     monkeypatch.setattr(kiro_native_bridge, "kill_session", _fake_kill)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    native_spec = _harness_spec("kiro-native")
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
