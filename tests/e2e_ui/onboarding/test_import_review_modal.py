@@ -7,34 +7,14 @@ the rest of the real UI runs against the live e2e server.
 
 from __future__ import annotations
 
-import asyncio
-import threading
-from collections.abc import Coroutine
-from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Page, Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_import_e2e"
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 _HOSTS = {
@@ -104,7 +84,7 @@ async def _drive(base_url: str) -> None:
             await _register_routes(page)
             await page.goto(f"{base_url}/")
 
-            dialog = page.get_by_role("dialog", name="Your imports are ready")
+            dialog = page.get_by_role("dialog", name="Your setup is ready")
             await expect(dialog).to_be_visible(timeout=30_000)
             await expect(dialog).to_contain_text("These carry over automatically.")
             await expect(dialog).to_contain_text("Databricks AI Gateway")
@@ -173,7 +153,7 @@ async def _drive_empty(base_url: str) -> None:
             )
             # Give the gate a moment to act on the settled inventory.
             await page.wait_for_timeout(1_000)
-            await expect(page.get_by_role("dialog", name="Your imports are ready")).to_be_hidden()
+            await expect(page.get_by_role("dialog", name="Your setup is ready")).to_be_hidden()
             reviewed = await page.evaluate(
                 f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
             )
