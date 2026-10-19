@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from omnigent_bot_core.events import host_id_of
-from omnigent_bot_core.oauth import DeviceGrantUnavailableError, OAuthError
+from omnigent_bot_core.oauth import (
+    DeviceGrantUnavailableError,
+    OAuthError,
+    PerUserLoginUnavailableError,
+)
 from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     OmnigentClient,
@@ -499,6 +503,12 @@ class SetupFlow:
         client_id = slack_client_id(await self._team_name(client, team_id))
         try:
             pending = await self._auth.authorize(server_url=server_url, client_id=client_id)
+        except PerUserLoginUnavailableError as exc:
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(server_url, str(exc)),
+            )
+            return
         except DeviceGrantUnavailableError as exc:
             self._logger.info("Device grant unavailable server=%s error=%s", server_url, exc)
             await client.views_update(

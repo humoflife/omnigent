@@ -45,7 +45,7 @@ from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
@@ -216,6 +216,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -319,6 +320,10 @@ async def _wake_runner_for_model_change(
     return conv
 
 
+# Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
+# mirroring/cleanup (6s) to finish before the server restores a selection.
+_CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
+
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
     "The previous selections have been restored."
@@ -410,6 +415,7 @@ def register_core_routes(
         user_id: str | None,
         sandbox_provider: str | None,
         workspaces: list[str],
+        requested_host_id: str | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -443,6 +449,9 @@ def register_core_routes(
             parallel; empty for an empty sandbox. One repo becomes the
             session's working directory; several are cloned as siblings
             and the working directory is the parent that holds them.
+        :param requested_host_id: Host id the caller chose for the sandbox
+            host (already checked against existing hosts),
+            or ``None`` to let the launch mint one.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -457,6 +466,7 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
+            REQUESTED_HOST_ID_LABEL_KEY,
             managed_repo_labels,
             parse_repo_workspace,
         )
@@ -486,23 +496,32 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
+        managed_labels: dict[str, str] = {}
+        if requested_host_id is not None:
+            managed_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
         if workspaces:
             # The session row's workspace is overwritten with the CLONED path at
             # bind time; record the raw request value(s) so a sandbox relaunch
             # can re-clone the same repositories. Stored one label per repo (not
             # a single joined value) so the 256-char label-value cap can't
             # silently truncate the list and drop repos on relaunch.
+            managed_labels.update(managed_repo_labels(workspaces))
+        if managed_labels:
             await asyncio.to_thread(
                 conversation_store.set_labels,
                 session_id,
-                managed_repo_labels(workspaces),
+                managed_labels,
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
         # session page immediately after this 201) already carries the
-        # "provisioning" stage.
-        _publish_sandbox_status(session_id, "provisioning")
+        # "provisioning" stage and the provider being launched.
+        _publish_sandbox_status(
+            session_id,
+            "provisioning",
+            provider=sandbox_provider or sandbox_config.default.provider,
+        )
         launch_task = asyncio.create_task(
             _run_managed_launch(
                 session_id=session_id,
@@ -519,10 +538,44 @@ def register_core_routes(
                 provider=sandbox_provider,
                 agent_store=agent_store,
                 agent_id=agent_id,
+                host_id=requested_host_id,
             )
         )
         _managed_launch_tasks.add(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
+
+    async def _check_requested_host_id(
+        request: Request, requested_host_id: str, user_id: str | None
+    ) -> None:
+        """
+        Reject a caller-chosen managed host id the launch could not register.
+
+        Not an idempotency key: the host row is written by the background
+        launch, so a retry could not find the session it would replay.
+
+        :param request: The originating request (for ``app.state`` lookups).
+        :param requested_host_id: The create's ``requested_host_id``.
+        :param user_id: The caller, who will own the host.
+        :raises OmnigentError: ``ALREADY_EXISTS`` if a host already has the id,
+            or one of the caller's hosts already has its derived name.
+        """
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.server.managed_hosts import managed_host_name
+
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_store is None:
+            return
+        name = managed_host_name(requested_host_id)
+        if await asyncio.to_thread(
+            host_store.host_identity_taken,
+            host_id=requested_host_id,
+            user_id=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            name=name,
+        ):
+            raise OmnigentError(
+                f"host {requested_host_id} or its name {name} is already in use",
+                code=ErrorCode.ALREADY_EXISTS,
+            )
 
     async def _bind_and_launch_on_caller_host(
         request: Request,
@@ -585,7 +638,11 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
-        from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.server.routes._host_launch import (
+            LAUNCH_TIMEOUT_ENV_VAR,
+            resolve_host_launch,
+            resolve_launch_timeout_s,
+        )
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -652,13 +709,20 @@ def register_core_routes(
                 ),
             )
         )
+        launch_timeout_s = resolve_launch_timeout_s()
         try:
             host_registry.send_text(conn, launch_frame)
-            launch_result = await asyncio.wait_for(future, timeout=30.0)
+            launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            launch_result = {"status": "failed", "error": "host launch timed out"}
+            launch_result = {
+                "status": "failed",
+                "error": (
+                    f"host launch timed out after {launch_timeout_s:g}s "
+                    f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
+                ),
+            }
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():
@@ -766,6 +830,10 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        # Checked before the session exists so a rejected create leaves nothing
+        # behind.
+        if body.requested_host_id is not None:
+            await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -869,10 +937,6 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
-        # Push the new session to this user's other open tabs (see the
-        # multipart path above for the rationale).
-        _announce_session_added(user_id, resp.id)
-
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The
@@ -883,15 +947,24 @@ def register_core_routes(
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
         launch_host_id = body.host_id
-        if body.host_type == "managed" and resp.runner_id is None:
-            await _schedule_managed_launch(
-                request,
-                session_id=resp.id,
-                agent_id=conv.agent_id if conv is not None else None,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=body.managed_repo_workspaces(),
-            )
+        try:
+            if body.host_type == "managed" and resp.runner_id is None:
+                await _schedule_managed_launch(
+                    request,
+                    session_id=resp.id,
+                    agent_id=conv.agent_id if conv is not None else None,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=body.managed_repo_workspaces(),
+                    requested_host_id=body.requested_host_id,
+                )
+        finally:
+            # Push the new session to this user's other open tabs (see the
+            # multipart path above for the rationale) once its managed labels
+            # are written, so a tab that lists it on this push sees the row the
+            # create returns. Still pushed when the managed guard fails: the
+            # owned row stays visible either way (see the grant above).
+            _announce_session_added(user_id, resp.id)
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must
@@ -1019,6 +1092,19 @@ def register_core_routes(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
+        if parsed_metadata.mcp_registry_services:
+            from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
+            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+
+            for service_id in parsed_metadata.mcp_registry_services:
+                _require_registry_service(request, service_id, user_id)
+            labels = {
+                **parsed_metadata.labels,
+                **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),
+            }
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
+            spec = selected_mcp_spec(spec, labels)
+
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
         # (mirroring the JSON path — a bad workspace never produces a
@@ -1038,6 +1124,19 @@ def register_core_routes(
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(spec),
+            host_id=parsed_metadata.host_id,
+            runner_id=inherited_runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
@@ -1269,6 +1368,7 @@ def register_core_routes(
         session_id: str,
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
+        include_live_status: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
     ) -> SessionResponse:
@@ -1291,6 +1391,11 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_live_status: When ``False``, skip the live-status
+            probe of the session's bound runner on a status-cache miss
+            and report ``status`` from the cached or persisted value.
+            Runner-owned reads pass ``False`` because the probe targets
+            the very runner waiting on this response.
         :param include_usage: When ``False``, skip the subtree usage read and
             return null usage fields with ``usage_included=False``. Display
             clients can independently request this route with
@@ -1323,6 +1428,7 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_live_status=include_live_status,
             include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
@@ -2606,9 +2712,33 @@ def register_core_routes(
             else:
                 from omnigent.server.routes import sessions as _sf
 
+                if (
+                    runner_router is not None
+                    and conv.host_id is None
+                    and conv.kind == "default"
+                    and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+                    and not runner_router.runner_is_online(body.runner_id.strip())
+                ):
+                    host_id = await asyncio.to_thread(
+                        routing_host_id,
+                        dataclasses.replace(conv, runner_id=body.runner_id.strip()),
+                        conversation_store,
+                    )
+                    if host_id is not None and await asyncio.to_thread(
+                        runner_router.host_is_on_another_replica, host_id
+                    ):
+                        raise OmnigentError(
+                            "side chat runner is connected to another server replica",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
+                if runner_router is not None:
+                    await asyncio.to_thread(
+                        runner_router.require_mcp_registry_support,
+                        dataclasses.replace(conv, runner_id=runner_id),
+                    )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id
@@ -2751,8 +2881,8 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        updated = await asyncio.to_thread(
-            conversation_store.update_conversation,
+        update_result = await asyncio.to_thread(
+            conversation_store.update_conversation_with_changes,
             session_id,
             title=body.title,
             reasoning_effort=None if clear_effort else effort,
@@ -2771,8 +2901,10 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
-        if updated is None:
+        if update_result is None:
             raise _session_not_found()
+        updated = update_result.conversation
+        effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
             # An active live change orders this write against its own when refused.
@@ -2821,9 +2953,16 @@ def register_core_routes(
         # This server rolls back Codex refusals and keeps unconfirmed changes, so the
         # runner neither saves a refusal nor waits out this server's forward timeout.
         negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        settings_forward_timeout = (
+            _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
+        )
         combined_model_forward = False
         _model_forward = None
-        if live_forward and (effort is not None or clear_effort):
+        if (
+            live_forward
+            and (effort is not None or clear_effort)
+            and (effort_changed or (live_model_change and codex_native))
+        ):
             effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,
@@ -2846,10 +2985,7 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 event,
-                # Same TUI injection budget as the model change below: the
-                # ``/effort`` confirm dialog can render seconds after the
-                # command.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                timeout_s=settings_forward_timeout,
             )
             model_applied = bool(
                 combined_model_forward
@@ -2866,7 +3002,7 @@ def register_core_routes(
                         session_id,
                         runner_router,
                         effort_event,
-                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                        timeout_s=settings_forward_timeout,
                     )
             if codex_native and (
                 (effort_forward is None and model_applied)
@@ -2911,8 +3047,7 @@ def register_core_routes(
                     session_id,
                     runner_router,
                     {"type": "model_change", "model": updated.model_override, **negotiation},
-                    # The runner can answer by confirming a TUI model dialog.
-                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    timeout_s=settings_forward_timeout,
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -3218,7 +3353,8 @@ def register_core_routes(
         exists — and the sandbox is registered to the FORKING caller, not
         to the source session's owner. The fork's workspace is the
         repository named by ``body.workspace``, or the one the source
-        recorded when that field is omitted.
+        recorded when that field is omitted. ``body.host_id`` names the
+        fork's new sandbox host, as on a managed create.
 
         :param request: The incoming FastAPI request (for auth).
         :param source_id: Session/conversation identifier of the
@@ -3232,7 +3368,10 @@ def register_core_routes(
             owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured.
+            for a sandbox this server has not configured; 409 if
+            ``body.host_id`` is already in use; 410 if the
+            source's agent was removed or a required bundle copy finds
+            its source missing.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -3446,7 +3585,12 @@ def register_core_routes(
         # otherwise ride along as stale metadata that could hydrate a wrong mode
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
+            from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.update(
+                key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -3466,10 +3610,19 @@ def register_core_routes(
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
 
-        # A side-chat fork is hidden from the left sidebar (it surfaces only as a
-        # Workspace-rail tab). Stamp the label the sessions-list filter reads.
+        # Side chats use the source for shared-runner routing and stay hidden
+        # from the sidebar while appearing in the Workspace rail.
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
+            extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
+
+        # A managed fork's chosen sandbox host id is born with the row, as on a
+        # create: the caller routes the fork by it until its host binds, so no
+        # read of the row may miss it. The source's own id was dropped above.
+        if body.host_type == "managed" and body.host_id is not None:
+            from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+            extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.host_id
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
@@ -3610,6 +3763,9 @@ def register_core_routes(
                     sizes=[stored.bytes for stored in filesystem_sources],
                 )
 
+        if body.host_id is not None:
+            await _check_requested_host_id(request, body.host_id, user_id)
+
         # Copied last, after every validation above; the copy row itself is
         # inserted inside fork_conversation's transaction.
         fork_agent_id = base_agent.id
@@ -3733,13 +3889,6 @@ def register_core_routes(
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
-        # Push the forked session to this user's other open tabs — but NOT a
-        # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
-        # row, so announcing it would leak it into every open sidebar (the
-        # real-time path bypasses the list-endpoint's side-chat filter).
-        if not body.side_chat:
-            _announce_session_added(user_id, new_conv.id)
-
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
         # Managed host: schedule the fork's own BACKGROUND sandbox provision
@@ -3749,20 +3898,30 @@ def register_core_routes(
         # ALL of the repositories the source recorded (read off the SOURCE,
         # since a fork never inherits the labels itself), so cloning a
         # multi-repo sandbox session lands the fork with every repo.
-        if body.host_type == "managed":
-            fork_workspaces = (
-                ([body.workspace] if body.workspace is not None else [])
-                if workspace_set
-                else read_managed_repo_workspaces(source.labels)
-            )
-            await _schedule_managed_launch(
-                request,
-                session_id=new_conv.id,
-                agent_id=new_conv.agent_id,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=fork_workspaces,
-            )
+        try:
+            if body.host_type == "managed":
+                fork_workspaces = (
+                    ([body.workspace] if body.workspace is not None else [])
+                    if workspace_set
+                    else read_managed_repo_workspaces(source.labels)
+                )
+                await _schedule_managed_launch(
+                    request,
+                    session_id=new_conv.id,
+                    agent_id=new_conv.agent_id,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=fork_workspaces,
+                    requested_host_id=body.host_id,
+                )
+        finally:
+            # Push the forked session to this user's other open tabs — but NOT a
+            # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
+            # row, so announcing it would leak it into every open sidebar (the
+            # real-time path bypasses the list-endpoint's side-chat filter).
+            # Pushed once its managed labels are written, as on a create.
+            if not body.side_chat:
+                _announce_session_added(user_id, new_conv.id)
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
         # caller's own view.
