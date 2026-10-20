@@ -55,8 +55,8 @@ from tests.e2e.conftest import (
 
 try:
     from omnigent_bot_core.omnigent import OmnigentClient, ServerUnreachableError
-except ModuleNotFoundError:  # Checkout without the omnigent-slack editable install.
-    sys.path.insert(0, str(_REPO_ROOT / "integrations" / "slack" / "src"))
+except ModuleNotFoundError:  # Checkout without the omnigent-bot-core editable install.
+    sys.path.insert(0, str(_REPO_ROOT / "integrations" / "bot-core" / "src"))
     from omnigent_bot_core.omnigent import OmnigentClient, ServerUnreachableError
 
 # The scripted answer the mock LLM releases once the gate opens. The turn is

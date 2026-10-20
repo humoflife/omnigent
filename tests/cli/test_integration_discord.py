@@ -51,7 +51,7 @@ def test_discord_foreground_runs_the_discord_package(data_dir: Path) -> None:
         run.return_value = mock.Mock(returncode=0)
         result = runner.invoke(cli, ["integration", "discord"])
     assert result.exit_code == 0
-    assert run.call_args.args[0][1:] == ["-m", "omnigent_discord"]
+    assert run.call_args.args[0][1:] == ["-P", "-m", "omnigent_discord"]
 
 
 def test_discord_background_lifecycle(data_dir: Path) -> None:
@@ -66,7 +66,7 @@ def test_discord_background_lifecycle(data_dir: Path) -> None:
         start = runner.invoke(cli, ["integration", "discord", "--background"])
         assert start.exit_code == 0, start.output
         assert "4711" in start.output
-        assert popen.call_args.args[0][1:] == ["-m", "omnigent_discord"]
+        assert popen.call_args.args[0][1:] == ["-P", "-m", "omnigent_discord"]
 
         status = runner.invoke(cli, ["integration", "discord", "status"])
         assert "Discord bot: running" in status.output and "4711" in status.output
