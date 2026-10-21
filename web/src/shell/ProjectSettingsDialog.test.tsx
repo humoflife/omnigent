@@ -4,14 +4,20 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
   updateProjectConfig: vi.fn(),
   createProject: vi.fn(),
 }));
+// Hoisted so the vi.mock factory can reference it; per-test overrides let
+// cases control the host-resolved model catalog (default: empty, so the
+// Claude static-alias fallback is what populates the picker).
+const { hostModelOptionsMock } = vi.hoisted(() => ({ hostModelOptionsMock: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
+  useHostModelOptions: hostModelOptionsMock,
 }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides
 // let cases control the agent catalog (the default is set in beforeEach).
@@ -28,7 +34,7 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
     name: "hello",
     display_name: "Hello",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -36,14 +42,13 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
 }));
-// The filesystem browser owns its own data-fetching; stub it to a marker plus
-// a button that reports a navigated path, so we can drive the disclosure and
-// the live workspace update without the host-filesystem plumbing.
+// The filesystem browser owns its own data-fetching; stub its explicit commit
+// action so this suite can drive the shared dialog without filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (p: string) => p.startsWith("/"),
-  WorkspacePicker: ({ onNavigate }: { onNavigate: (p: string) => void }) => (
+  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <div data-testid="mock-workspace-picker">
-      <button type="button" onClick={() => onNavigate("/picked/dir")}>
+      <button type="button" onClick={() => onSelect("/picked/dir")}>
         pick dir
       </button>
     </div>
@@ -58,7 +63,14 @@ function renderDialog(projectId: string | null = "p_1") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <ProjectSettingsDialog open onOpenChange={vi.fn()} projectId={projectId} projectName="Work" />
+      <TooltipProvider>
+        <ProjectSettingsDialog
+          open
+          onOpenChange={vi.fn()}
+          projectId={projectId}
+          projectName="Work"
+        />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }
@@ -69,6 +81,8 @@ beforeEach(() => {
   createMock.mockReset();
   availableAgentsMock.mockReset();
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
+  hostModelOptionsMock.mockReset();
+  hostModelOptionsMock.mockReturnValue({ data: [] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
@@ -115,6 +129,27 @@ describe("ProjectSettingsDialog", () => {
 
     await waitFor(() => expect(updateMock).toHaveBeenCalled());
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
+  });
+
+  it("preserves the project icon when saving settings", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { icon: "🔥", use_worktree: true },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-worktree")).toHaveAttribute(
+        "data-state",
+        "checked",
+      ),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { icon: "🔥", use_worktree: true }),
+    );
   });
 
   it("stores nothing for the worktree toggle when left at its default (OFF)", async () => {
@@ -221,7 +256,7 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("opens the working-directory browser, updates the path, then closes on outside click", async () => {
+  it("opens the working-directory dialog and commits the confirmed path", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
     renderDialog();
     // A stored online host makes the working directory browsable — a compact
@@ -229,14 +264,11 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(screen.getByText("Browse…")).toBeInTheDocument());
     expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
 
-    // Expand → the browser mounts; navigating updates the trigger label live.
+    // Open the shared modal; confirming updates the trigger and closes it.
     fireEvent.click(screen.getByText("Browse…"));
     expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
     fireEvent.click(screen.getByText("pick dir"));
     expect(screen.getByText("/picked/dir")).toBeInTheDocument();
-
-    // The click-away backdrop closes the browser, keeping the picked path.
-    fireEvent.click(screen.getByRole("button", { name: /close directory browser/i }));
     expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("project-settings-save"));
@@ -281,7 +313,7 @@ describe("ProjectSettingsDialog", () => {
     );
 
     // Open the agent picker dropdown (Radix opens on pointerdown), then the
-    // "Custom agents" submenu where composed agents are listed.
+    // custom-agent "Other..." submenu where composed agents are listed.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_1")).toBeInTheDocument();
@@ -293,5 +325,99 @@ describe("ProjectSettingsDialog", () => {
         ([opts]) => (opts as { pinnedAgentIds?: string[] } | undefined)?.pinnedAgentIds != null,
       ),
     ).toBe(true);
+  });
+
+  // A model default belongs only to a native harness that takes a model
+  // override (Claude Code / Codex). These pin the control's visibility, its
+  // round-trip through save, and the data-safety edges around it.
+  const claudeAgent = () =>
+    pickerAgent({
+      id: "ag_claude",
+      name: "claude-native-ui",
+      display_name: "Claude Code",
+      harness: "claude-native",
+    });
+
+  it("offers a model default only when the default agent has a model choice", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
+
+    // Switch the default to a plain bundle agent (under "Other...") → the
+    // model field goes away.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("project-settings-model")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("round-trips a stored model default on save", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
+    // The stored alias seeds the control (the static Claude vocab labels it).
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent(/opus/i),
+    );
+
+    // Save untouched — the model rides back out unchanged.
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+    );
+  });
+
+  it("drops a stale model default when the agent has no model choice", async () => {
+    // A model stored while Claude Code was the default must not linger as an
+    // invisible key after the default agent changes to one without a model
+    // override (nothing would consume it, and the field can't clear it).
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_1", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    expect(screen.queryByTestId("project-settings-model")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
+  });
+
+  it("preserves a stored model when the default agent hasn't resolved from discovery", async () => {
+    // While agent discovery is loading/failing, the stored agent's model
+    // capability is unknowable — an unrelated save in that window must not
+    // silently delete a valid stored default.
+    availableAgentsMock.mockReturnValue({ data: [] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+    );
   });
 });

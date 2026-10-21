@@ -32,6 +32,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
@@ -67,6 +68,7 @@ def _spawn_host_daemon(
     tmp_path: Path,
     live_server: str,
     mock_llm_server_url: str,
+    interactive_shells: list[str] | None = None,
 ) -> _SpawnedHostDaemon:
     """
     Spawn an isolated host daemon for a single host e2e test.
@@ -89,6 +91,7 @@ def _spawn_host_daemon(
         ``"http://localhost:18501"``.
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
         ``"http://127.0.0.1:12345"``.
+    :param interactive_shells: Optional deterministic host inventory for tests.
     :returns: The spawned daemon handle and its host_id.
     """
     omni_dir = tmp_path / ".omnigent"
@@ -114,13 +117,32 @@ def _spawn_host_daemon(
         "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
+    command = [
+        runner_executable(),
+        "-m",
+        "omnigent.host._daemon_entry",
+        "--server",
+        live_server,
+    ]
+    if interactive_shells is not None:
+        command = [
+            runner_executable(),
+            "-c",
+            (
+                "import sys; "
+                "from omnigent.host.connect import run_host_process; "
+                "run_host_process(sys.argv[1], interactive_shells=sys.argv[2:])"
+            ),
+            live_server,
+            *interactive_shells,
+        ]
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
             # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
             # else the test process's python. apply_runner_env drops the inherited
             # worktree PYTHONPATH in that mode; the old host launches old runners
             # (colocated) from its own venv.
-            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            command,
             env=apply_runner_env(env),
             cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
@@ -264,6 +286,72 @@ def test_host_connect_and_list(
     resp = http_client.get(f"/v1/hosts/{host_id}")
     if resp.status_code == 200:
         assert resp.json()["status"] == "offline", "Host should be offline after daemon is killed"
+
+
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="needs zsh on the server-side machine")
+def test_native_shells_follow_bash_only_host_inventory(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """The UI-shaped native session offers and launches only host shells."""
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+        interactive_shells=["bash"],
+    )
+    try:
+        _wait_for_host_online(http_client, daemon.host_id, timeout=30.0)
+        host = http_client.get(f"/v1/hosts/{daemon.host_id}")
+        host.raise_for_status()
+        assert host.json()["interactive_shells"] == ["bash"]
+
+        agents = http_client.get("/v1/agents", params={"limit": 100})
+        agents.raise_for_status()
+        agent_id = next(
+            row["id"] for row in agents.json()["data"] if row["name"] == CLAUDE_NATIVE_AGENT_NAME
+        )
+        workspace = tmp_path / "bash-only-workspace"
+        workspace.mkdir()
+        created = http_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": daemon.host_id,
+                "workspace": str(workspace),
+            },
+            timeout=60.0,
+        )
+        created.raise_for_status()
+        session_id = created.json()["id"]
+
+        agent = http_client.get(f"/v1/sessions/{session_id}/agent")
+        agent.raise_for_status()
+        assert agent.json()["terminals"] == ["bash"]
+
+        rejected = http_client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "zsh", "session_key": "missing"},
+            timeout=30.0,
+        )
+        assert rejected.status_code == 400, rejected.text
+
+        launched = http_client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "bash", "session_key": "e2e"},
+            timeout=90.0,
+        )
+        launched.raise_for_status()
+        assert launched.json()["metadata"]["terminal_name"] == "bash"
+    finally:
+        daemon.proc.send_signal(signal.SIGTERM)
+        try:
+            daemon.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.proc.kill()
+            daemon.proc.wait()
 
 
 def _wait_for_host_online_by_name(
@@ -544,12 +632,20 @@ def test_native_terminal_start_failure_names_the_readable_runner_log(
             f"expected the goose terminal start to fail, got {ensure_resp.status_code}: "
             f"{ensure_resp.text}"
         )
-        message = ensure_resp.json()["error"]["message"]
+        error = ensure_resp.json()["error"]
+        message = error["message"]
         assert "Native Goose terminal failed to start" in message, message
+
+        # The server normalizes runner errors to code + message, so recover the
+        # runner's correlation ID from that preserved public message.
+        error_id_match = re.search(r" Error ID: (err_[0-9a-f]{32})\.$", message)
+        assert error_id_match is not None, f"message has no error ID: {message!r}"
+        error_id = error_id_match.group(1)
+        error_id_suffix = error_id_match.group(0)
 
         # The daemon runs with HOME=tmp_path, so the runner's home-relative
         # path resolves back under the test's temp dir.
-        named_path = message.rsplit(": ", 1)[-1]
+        named_path = message.removesuffix(error_id_suffix).rsplit(": ", 1)[-1]
         assert named_path.endswith(".log"), f"message names no log file: {message!r}"
         runner_log = tmp_path / named_path[2:] if named_path.startswith("~/") else Path(named_path)
         assert runner_log.exists(), (
@@ -557,7 +653,9 @@ def test_native_terminal_start_failure_names_the_readable_runner_log(
         )
         # The message stays free of the raw cause; the named log carries it.
         assert "requires the 'goose' CLI" not in message
-        assert "requires the 'goose' CLI" in runner_log.read_text()
+        runner_log_text = runner_log.read_text()
+        assert "requires the 'goose' CLI" in runner_log_text
+        assert error_id in runner_log_text
 
     finally:
         host_proc.send_signal(signal.SIGTERM)
@@ -1240,3 +1338,154 @@ def test_host_retry_session_recovers_killed_runner(
             except subprocess.TimeoutExpired:
                 host_proc.kill()
                 host_proc.wait()
+
+
+def _wait_for_runner_status(
+    client: httpx.Client, runner_id: str, *, online: bool, timeout: float = 30.0
+) -> None:
+    """Poll ``GET /v1/runners/{id}/status`` until the runner reports *online*.
+
+    :param client: HTTP client pointed at the server.
+    :param runner_id: Runner to watch, e.g. ``"runner_token_ab12..."``.
+    :param online: The ``online`` value to wait for.
+    :param timeout: Max seconds to wait.
+    :raises AssertionError: If the runner never reaches that state.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = client.get(f"/v1/runners/{runner_id}/status")
+        if status.status_code == 200 and bool(status.json().get("online")) is online:
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Runner {runner_id} did not reach online={online} within {timeout}s")
+
+
+def _kill_launched_runner(
+    client: httpx.Client, daemon: _SpawnedHostDaemon, runner_id: str
+) -> None:
+    """SIGKILL one host-launched runner, leaving its host connected.
+
+    :param client: HTTP client pointed at the server.
+    :param daemon: Host daemon that launched the runner.
+    :param runner_id: Runner to kill; its pid comes from the daemon log.
+    """
+    match = re.search(
+        rf"Launched runner {re.escape(runner_id)} for workspace .*? \(pid=(\d+)\)",
+        daemon.daemon_log.read_text(),
+    )
+    assert match is not None, f"no launch of {runner_id} in:\n{daemon.daemon_log.read_text()}"
+    os.kill(int(match.group(1)), signal.SIGKILL)
+    _wait_for_runner_status(client, runner_id, online=False, timeout=15.0)
+
+
+def _assert_round_trip(client: httpx.Client, session_id: str, marker: str) -> None:
+    """Send one message and assert the scripted reply comes back.
+
+    :param client: HTTP client pointed at the server.
+    :param session_id: Session to message.
+    :param marker: Reply text the mock LLM is configured to return.
+    """
+    response_id = send_user_message_to_session(
+        client,
+        session_id=session_id,
+        content=f"Reply with exactly {marker} and nothing else.",
+    )
+    body = poll_session_until_terminal(
+        client, session_id=session_id, response_id=response_id, timeout=120
+    )
+    assert body["status"] == "completed", f"turn failed: {body.get('error')}"
+    assert marker in final_assistant_text(body)
+
+
+def _shared_live_runner(client: httpx.Client, parent_id: str, side_chat_id: str) -> str:
+    """Assert a side chat and its parent are bound to one live runner.
+
+    :param client: HTTP client pointed at the server.
+    :param parent_id: The side chat's source session.
+    :param side_chat_id: The hostless side chat.
+    :returns: The shared runner id.
+    """
+    parent = client.get(f"/v1/sessions/{parent_id}").json()
+    side_chat = client.get(f"/v1/sessions/{side_chat_id}").json()
+    assert side_chat["host_id"] is None
+    assert side_chat["runner_id"] is not None
+    assert side_chat["runner_id"] == parent["runner_id"], (parent, side_chat)
+    assert side_chat["runner_online"] is True, side_chat
+    return str(side_chat["runner_id"])
+
+
+def test_host_side_chat_recovers_after_shared_runner_exits(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """A side chat whose shared runner died recovers through its parent.
+
+    A side chat has no host of its own: the web binds it to its parent's live
+    runner. With that runner killed and the host still up, the side chat's next
+    message relaunches the parent's runner on its host and moves both sessions
+    onto it. After another exit, Resume on the side chat does the same.
+    """
+    # Equal-length tokens: the mock routes on the newest one in the history.
+    markers = [f"SIDECHAT{i}{uuid.uuid4().hex[:12].upper()}" for i in range(5)]
+    for marker in markers:
+        configure_mock_llm(mock_llm_server_url, [{"text": marker}], match=marker)
+
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    try:
+        _wait_for_host_online(http_client, daemon.host_id, timeout=30.0)
+        agent_id = lookup_agent_id(
+            http_client, upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+        )
+        created = http_client.post(
+            "/v1/sessions",
+            json={"agent_id": agent_id, "host_id": daemon.host_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        created.raise_for_status()
+        parent_id = created.json()["id"]
+        first_runner = created.json()["runner_id"]
+        _wait_for_runner_status(http_client, first_runner, online=True)
+        _assert_round_trip(http_client, parent_id, markers[0])
+
+        # Fork and bind the side chat the way the web's createSideChat does.
+        fork = http_client.post(
+            f"/v1/sessions/{parent_id}/fork", json={"title": "Side chat", "side_chat": True}
+        )
+        fork.raise_for_status()
+        side_chat_id = fork.json()["id"]
+        http_client.patch(
+            f"/v1/sessions/{side_chat_id}", json={"runner_id": first_runner}
+        ).raise_for_status()
+        _assert_round_trip(http_client, side_chat_id, markers[1])
+
+        _kill_launched_runner(http_client, daemon, first_runner)
+        _assert_round_trip(http_client, side_chat_id, markers[2])
+        recovered_runner = _shared_live_runner(http_client, parent_id, side_chat_id)
+        assert recovered_runner != first_runner
+        _assert_round_trip(http_client, parent_id, markers[3])
+
+        _kill_launched_runner(http_client, daemon, recovered_runner)
+        retry = http_client.post(
+            f"/v1/sessions/{side_chat_id}/events",
+            json={"type": "retry_session", "data": {}},
+            timeout=120.0,
+        )
+        assert retry.status_code in (200, 202), retry.text
+        assert retry.json().get("recovery") == "runner_relaunched", retry.json()
+        resumed_runner = _shared_live_runner(http_client, parent_id, side_chat_id)
+        assert resumed_runner not in (first_runner, recovered_runner)
+        _assert_round_trip(http_client, side_chat_id, markers[4])
+    finally:
+        if daemon.proc.poll() is None:
+            daemon.proc.send_signal(signal.SIGTERM)
+            try:
+                daemon.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.proc.kill()
+                daemon.proc.wait()

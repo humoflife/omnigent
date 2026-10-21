@@ -83,6 +83,18 @@ class RetryPolicy:
         Used only by the in-process LLM path and the tool-retry
         classifier — L0 SDKs ignore this and L2 receives
         already-classified errors.
+
+    .. note::
+        MCP tool-call reconnect-retries are at-least-once: a call
+        whose connection died — or whose response was lost to a
+        transient network failure after the server accepted the
+        request — is retried on a fresh connection even though the
+        server may have fully executed it. Non-idempotent MCP tools
+        (writes, payments, message sends) can therefore run more
+        than once under transient network failures; tools that need
+        exactly-once semantics must implement their own idempotency
+        (e.g. idempotency keys), or the server should be configured
+        with ``max_retries=0``.
     """
 
     max_retries: int = 7
@@ -420,7 +432,7 @@ class DatabricksAuth:
     ``~/.databrickscfg``.
 
     Use this to route LLM calls through Databricks model serving
-    (Unity AI Gateway or another Databricks-hosted endpoint) using
+    (Unity Gateway or another Databricks-hosted endpoint) using
     a named credential profile.
 
     Example YAML::
@@ -555,8 +567,9 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         auto-detection, telemetry, and tool-provider inference.
         ``None`` only when no model is declared anywhere in the spec.
     :param reasoning_effort: Default reasoning level for this agent,
-        e.g. ``"high"``. Read from the ``executor.reasoning_effort``
-        YAML key, alongside ``model``. Applies when nothing more
+        e.g. ``"high"``. Populated by the parser from either the
+        ``executor.reasoning_effort`` YAML key or (for backward
+        compatibility) ``llm.reasoning_effort``. Applies when nothing more
         specific asks for one: a per-dispatch
         ``sys_session_send``/``sys_session_create`` argument wins over
         it, and it in turn wins over whatever default the harness CLI
@@ -607,7 +620,8 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # the parser from executor.model or (backward compat) llm.model.
     model: str | None = None
     # Spec-level default reasoning effort, applied when no per-dispatch
-    # value asks for one. Populated from executor.reasoning_effort.
+    # value asks for one. Populated from executor.reasoning_effort or
+    # (backward compat) llm.reasoning_effort.
     reasoning_effort: str | None = None
     # Per-provider connection overrides (api_key, base_url, etc.).
     # Populated from executor.connection or (backward compat) llm.connection.
@@ -651,9 +665,8 @@ class CompactionConfig:
     truncation as emergency fallback.
 
     :param trigger_threshold: Fraction of the model's context window
-        at which proactive compaction fires (after the first overflow
-        has been observed and the window size is known), e.g. ``0.8``
-        means fire at 80% of the window.
+        at which proactive compaction fires, e.g. ``0.8`` means fire
+        at 80% of the window.
     :param recent_window: Number of recent LLM iterations to protect
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most
@@ -865,12 +878,13 @@ class SkillSpec:
     """
     A parsed skill from ``skills/<dir>/SKILL.md``.
 
-    The directory name is provenance only — it is recorded in
-    :attr:`skill_dir` and need not equal :attr:`name`.
+    Like Claude Code, the directory name is the invocation identifier
+    and the frontmatter ``name`` is only a human-facing label.
 
-    :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
-        frontmatter, not from the directory name.
+    :param name: Invocation identifier, taken from the skill's
+        directory name, e.g. ``"asd-ste100"`` (typed as
+        ``/asd-ste100``). Bundled skills must match ``[a-z0-9-]+``.
+        Providers may namespace it, e.g. ``"plugin:asd-ste100"``.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -884,6 +898,10 @@ class SkillSpec:
         orchestration skills (frontmatter ``user-invocable: false``);
         such skills are excluded from the composer's ``/`` menu.
         Defaults to ``True`` (absent frontmatter field = invocable).
+    :param display_name: Human-facing label from the frontmatter
+        ``name``, e.g. ``"Simplified Technical English (ASD-STE100)"``.
+        May contain spaces. ``None`` when it equals :attr:`name` or the
+        source supplies no label (in-memory or CLI-listed skills).
     """
 
     name: str
@@ -891,6 +909,7 @@ class SkillSpec:
     content: str
     skill_dir: Path | None = None
     user_invocable: bool = True
+    display_name: str | None = None
 
 
 @dataclass
@@ -964,7 +983,7 @@ class MCPServerConfig:
     """
 
     name: str
-    transport: Literal["http", "stdio"] = "http"
+    transport: Literal["http", "stdio", "registry"] = "http"
     # HTTP-only fields.
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict, repr=False)
@@ -1041,9 +1060,9 @@ class SharePolicy(str, Enum):
     - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
       registered at all (default).
     - :attr:`NON_PUBLIC`: the agent may grant access to named users
-      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+      (emails), but NOT to ``__public__``.
     - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
-      (anonymous read of the full transcript).
+      (link access subject to server authentication and its public permission ceiling).
     """
 
     NONE = "none"
@@ -1131,12 +1150,16 @@ class Phase(str, Enum):
     (``Phase("tool_call")``) and preserves the string form in
     logs / JSON serialization.
 
-    Session-level phases (fire once per turn):
+    Session-level phases:
 
     - ``REQUEST``: after a new user message arrives, before
       the LLM turn.
-    - ``RESPONSE``: after the LLM's final assistant message,
-      before persistence.
+    - ``RESPONSE``: before assistant text is persisted. The runner relay
+      evaluates each nonempty segment, including text before tool calls.
+      ``EvaluationContext.turn_final`` identifies the final segment of a
+      successful turn; response policies should skip only explicit
+      ``False`` for completion actions, preserving callers that supply
+      ``None``. Content checks should evaluate every segment.
 
     Tool phases (fire per tool invocation):
 
@@ -1356,12 +1379,18 @@ class PolicySpec:
         ``GuardrailsSpec.ask_timeout``. Useful when some ASKs
         are cheap (yes/no) and some expensive (review a 50 KB
         document).
+    :param workspace_id: Databricks workspace id that owns a
+        DB-stored policy row (populated when the spec is built
+        from a stored policy). ``None`` for YAML / agent-spec
+        policies, which are not workspace-scoped rows. Surfaced
+        so a denial can be attributed to the owning workspace.
     """
 
     name: str
     on: list[PhaseSelector] | None
     condition: dict[str, str | list[str]] | None = None
     ask_timeout: int | None = None
+    workspace_id: int | None = None
 
 
 @dataclass
@@ -1537,7 +1566,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         session through the server API or CLI. One of
         :class:`SharePolicy`: ``none`` (default — tool not registered),
         ``non-public`` (grant named users only), or ``public`` (also
-        allow ``__public__`` anonymous read). **Defaults to
+        allow ``__public__`` link access). **Defaults to
         ``SharePolicy.NONE``.**
     """
 
@@ -1584,6 +1613,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    # Operator-approved model-signing authority. Separate from sandbox
+    # egress_rules so generic network access cannot authorize credentials.
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False

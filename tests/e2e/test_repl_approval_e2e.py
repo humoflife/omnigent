@@ -38,12 +38,15 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e.conftest import (
     configure_mock_llm,
     get_mock_requests,
@@ -149,7 +152,7 @@ def repl_env(
     llm_api_key: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-) -> dict[str, str]:
+) -> Iterator[dict[str, str]]:
     """
     Build the env dict for ``omnigent chat`` — OPENAI_API_KEY plus
     whatever PYTHONPATH the outer shell already provides (so
@@ -186,7 +189,7 @@ def repl_env(
     :param mock_llm_server_url: Base URL of the mock LLM server,
         e.g. ``"http://127.0.0.1:12345"``.
     :param tmp_path_factory: Pytest temp-path factory for the fake HOME.
-    :returns: Env mapping for ``pexpect.spawn``.
+    :yields: Env mapping for ``pexpect.spawn``; reaps this module's runtime on teardown.
     """
     real_databrickscfg = Path.home() / ".databrickscfg"
     fake_home = tmp_path_factory.mktemp("repl_home")
@@ -203,8 +206,13 @@ def repl_env(
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "HOME": str(fake_home),
         "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_DATA_DIR": str(config_home),
         "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
         "OMNIGENT_SKIP_ONBOARD": "1",
+        # Test tool callables live in this repo's ``tests`` package.
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")))
+        ),
         # Force ANSI on — pexpect captures everything, stripping
         # happens per-assertion via _strip_ansi.
         "TERM": "xterm-256color",
@@ -213,7 +221,28 @@ def repl_env(
         # sequences that throw off expect matches.
         "PROMPT_TOOLKIT_NO_CPR": "1",
     }
-    return env
+    env.pop("OMNIGENT_DATABASE_URI", None)
+    try:
+        yield env
+    finally:
+        _, survivors = reap_leaked_omnigent_processes(config_home)
+        assert not survivors, f"REPL test processes survived cleanup: {survivors}"
+
+
+@pytest.fixture
+def repl_transcript(repl_env: dict[str, str], request: pytest.FixtureRequest) -> Iterator[TextIO]:
+    """Retain the raw terminal stream alongside this module's runtime logs."""
+    log_dir = Path(repl_env["OMNIGENT_DATA_DIR"]) / "logs" / "cli"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=log_dir,
+        prefix=f"{request.node.name}-",
+        suffix=".log",
+        delete=False,
+    ) as stream:
+        yield stream
 
 
 def _configure_mock_text(
@@ -420,7 +449,7 @@ def test_repl_single_approval_allows_llm_response(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -516,7 +545,7 @@ def test_repl_refusal_shows_deny_sentinel(
     _configure_mock_text(mock_llm_server_url, ["should not appear"], match="deny-sentinel")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -580,7 +609,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -699,7 +728,7 @@ def test_repl_approve_always_caches_for_later_turns(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -801,7 +830,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_GATE_DIR)],
+        ["run", str(_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -877,7 +906,7 @@ def test_repl_tool_call_refusal_blocks_tool(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_GATE_DIR)],
+        ["run", str(_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1006,7 +1035,7 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_SUBAGENT_GATE_DIR)],
+        ["run", str(_SUBAGENT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1065,6 +1094,7 @@ def test_repl_label_driven_ask_approves(
     ap_cli: str,
     repl_env: dict[str, str],
     mock_llm_server_url: str,
+    repl_transcript: TextIO,
 ) -> None:
     """
     Two-turn label-ASK composition, approve path.
@@ -1097,13 +1127,14 @@ def test_repl_label_driven_ask_approves(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_LABEL_ASK_GATE_DIR)],
+        ["run", str(_LABEL_ASK_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    child.logfile_read = repl_transcript
     try:
         _wait_for_prompt_ready(
             child,
@@ -1113,12 +1144,13 @@ def test_repl_label_driven_ask_approves(
         # Turn 1: trigger taint — no ASK fires this turn
         # (condition checks the pre-evaluation snapshot).
         child.send("hello BANANA_TRIGGER label-approve" + "\r")
-        # The LLM still replies normally. Wait for turn end.
-        _wait_for_turn_complete(child, timeout=45)
+        # A scripted reply proves this turn ran; the toolbar may redraw in fragments.
+        child.expect("Got it, banana trigger noted", timeout=45)
         turn_one = child.before or ""
         if isinstance(turn_one, bytes):
             turn_one = turn_one.decode("utf-8", errors="replace")
         turn_one = _strip_ansi(turn_one)
+        turn_one += _read_pending(child, seconds=1.0)
         # Turn 1 MUST NOT show an approval banner — the
         # taint label didn't exist when the condition was
         # checked.
@@ -1127,8 +1159,6 @@ def test_repl_label_driven_ask_approves(
             "condition gate is reading the post-write snapshot.\n"
             f"Turn 1:\n{turn_one[:1500]}"
         )
-
-        _read_pending(child, seconds=1.0)
 
         # Turn 2: label persists from the store → condition
         # matches → ASK fires.
@@ -1159,6 +1189,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
     ap_cli: str,
     repl_env: dict[str, str],
     mock_llm_server_url: str,
+    repl_transcript: TextIO,
 ) -> None:
     """
     Same composition, refuse path.
@@ -1180,13 +1211,14 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_LABEL_ASK_GATE_DIR)],
+        ["run", str(_LABEL_ASK_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    child.logfile_read = repl_transcript
     try:
         _wait_for_prompt_ready(
             child,
@@ -1195,7 +1227,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
         )
         # Turn 1: taint.
         child.send("hi BANANA_TRIGGER label-refuse" + "\r")
-        _wait_for_turn_complete(child, timeout=45)
+        child.expect("Banana trigger received", timeout=45)
         _read_pending(child, seconds=1.0)
 
         # Turn 2: ASK fires, user refuses.
@@ -1203,15 +1235,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        _wait_for_turn_complete(child, timeout=45)
-        full_turn = child.before or ""
-        if isinstance(full_turn, bytes):
-            full_turn = full_turn.decode("utf-8", errors="replace")
-        full_turn = _strip_ansi(full_turn)
-        assert "Denied by policy" in full_turn, (
-            "Refused label-gated ASK did not produce a DENY sentinel.\n"
-            f"Captured:\n{full_turn[:1500]}"
-        )
+        child.expect("Denied by policy", timeout=45)
     finally:
         try:
             child.send("/quit" + "\r")
@@ -1261,7 +1285,7 @@ def test_repl_output_ask_does_not_prompt_in_repl(
     _configure_mock_text(mock_llm_server_url, [reply], match="output-noprompt")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_OUTPUT_GATE_DIR)],
+        ["run", str(_OUTPUT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1324,7 +1348,7 @@ def test_repl_output_ask_passes_reply_through_no_sentinel(
     _configure_mock_text(mock_llm_server_url, [reply], match="output-passthru")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_OUTPUT_GATE_DIR)],
+        ["run", str(_OUTPUT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1419,7 +1443,7 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_RESULT_GATE_DIR)],
+        ["run", str(_TOOL_RESULT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1507,7 +1531,7 @@ def test_repl_tool_result_ask_passes_output_through(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_RESULT_GATE_DIR)],
+        ["run", str(_TOOL_RESULT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1657,7 +1681,7 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_SUBAGENT_TOOL_GATE_DIR)],
+        ["run", str(_SUBAGENT_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",

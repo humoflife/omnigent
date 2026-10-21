@@ -82,6 +82,7 @@ function isUpdateSecurityError(message) {
  * @param {string} deps.iconPath Absolute path to the app icon PNG.
  * @param {boolean} [deps.forceDevUpdateConfig] Enable the development update
  *   config in an unpackaged build (main.js sets this from !app.isPackaged).
+ * @param {boolean} [deps.updatesEnabled] Disable the production feed for dev packages.
  * @param {() => string} [deps.getCurrentVersion] Version shown in update UI.
  *   Defaults to Electron's real app version.
  * @param {(installReady: boolean) => void} [deps.onInstallReadyChange]
@@ -111,6 +112,7 @@ function createDesktopUpdater({
   pinnedOrigin,
   iconPath,
   forceDevUpdateConfig = false,
+  updatesEnabled = true,
   getCurrentVersion = () => app.getVersion(),
   onInstallReadyChange = () => {},
 }) {
@@ -120,6 +122,7 @@ function createDesktopUpdater({
   // A user-initiated ("Check for Updates…") check in flight — lets the error
   // handler surface a failure to the user only when they explicitly asked.
   let manualCheckInFlight = false;
+  let statusBeforeCheck = null;
 
   function getConfig() {
     return normalizeUpdateConfig(loadSettings());
@@ -162,7 +165,7 @@ function createDesktopUpdater({
   }
 
   function canUseFeed() {
-    return app.isPackaged || autoUpdater.forceDevUpdateConfig === true;
+    return updatesEnabled && (app.isPackaged || autoUpdater.forceDevUpdateConfig === true);
   }
 
   function reportUnavailableInDev() {
@@ -183,10 +186,10 @@ function createDesktopUpdater({
     // v1 is stable-only and rides electron-updater's default "latest" channel.
     if (!canUseFeed() || cfg.mode === "none") return;
     if (cfg.mode === "manual") return;
-    autoUpdater.checkForUpdates().catch(() => {});
+    checkForUpdates().catch(() => {});
     if (cfg.mode === "default") {
       updateCheckTimer = setInterval(
-        () => autoUpdater.checkForUpdates().catch(() => {}),
+        () => checkForUpdates().catch(() => {}),
         PERIODIC_CHECK_INTERVAL_MS,
       );
       // Don't let the 6-hourly re-check keep the Node event loop alive at quit
@@ -201,14 +204,31 @@ function createDesktopUpdater({
     if (forceDevUpdateConfig) {
       autoUpdater.forceDevUpdateConfig = true;
     }
-    autoUpdater.on("checking-for-update", () => broadcast({ state: "checking" }));
+    autoUpdater.on("checking-for-update", () => {
+      if (
+        currentUpdateStatus.state !== "downloading" &&
+        currentUpdateStatus.state !== "downloaded"
+      ) {
+        broadcast({ state: "checking" });
+      }
+    });
     autoUpdater.on("update-available", (info) => {
       manualCheckInFlight = false;
-      broadcast({ state: "available", currentVersion: getCurrentVersion(), info });
+      if (
+        currentUpdateStatus.state !== "downloading" &&
+        currentUpdateStatus.state !== "downloaded"
+      ) {
+        broadcast({ state: "available", currentVersion: getCurrentVersion(), info });
+      }
     });
     autoUpdater.on("update-not-available", () => {
       manualCheckInFlight = false;
-      broadcast({ state: "none" });
+      if (
+        currentUpdateStatus.state !== "downloading" &&
+        currentUpdateStatus.state !== "downloaded"
+      ) {
+        broadcast({ state: "none" });
+      }
     });
     autoUpdater.on("download-progress", (progress) =>
       broadcast({ state: "downloading", progress }),
@@ -224,21 +244,28 @@ function createDesktopUpdater({
       console[isSecurity ? "error" : "warn"]("[omnigent] update error:", msg);
       if (isSecurity || wasManualCheck) {
         broadcast({ state: isSecurity ? "error-security" : "idle", lastError: msg });
+      } else if (currentUpdateStatus.state === "checking") {
+        broadcast(statusBeforeCheck ?? { state: "idle" });
       }
     });
     applyConfig(cfg);
   }
 
   function checkForUpdates({ manual = false } = {}) {
+    if (currentUpdateStatus.state === "downloading" || currentUpdateStatus.state === "downloaded") {
+      return Promise.resolve();
+    }
     if (!canUseFeed()) {
       if (manual) reportUnavailableInDev();
       return Promise.reject(unavailableInDevError());
     }
+    statusBeforeCheck = currentUpdateStatus;
     if (manual) manualCheckInFlight = true;
     return autoUpdater
       .checkForUpdates()
       .then(() => {
         if (manual) manualCheckInFlight = false;
+        statusBeforeCheck = null;
         return undefined;
       })
       .catch((err) => {
@@ -249,7 +276,10 @@ function createDesktopUpdater({
             state: isUpdateSecurityError(msg) ? "error-security" : "idle",
             lastError: msg,
           });
+        } else if (!manual && currentUpdateStatus.state === "checking") {
+          broadcast(statusBeforeCheck ?? { state: "idle" });
         }
+        statusBeforeCheck = null;
         throw err;
       });
   }
@@ -277,7 +307,21 @@ function createDesktopUpdater({
       reportUnavailableInDev();
       return Promise.reject(unavailableInDevError());
     }
-    return autoUpdater.downloadUpdate().then(() => undefined);
+    // Enter the progress state immediately instead of waiting for the first
+    // provider event. Fast downloads and slow-loading About windows then still
+    // get a truthful starting state from the cached updater snapshot.
+    broadcast({ state: "downloading", progress: { percent: 0 } });
+    return autoUpdater
+      .downloadUpdate()
+      .then(() => undefined)
+      .catch((err) => {
+        const message = String(err?.message ?? err);
+        broadcast({
+          state: isUpdateSecurityError(message) ? "error-security" : "idle",
+          lastError: message,
+        });
+        throw err;
+      });
   }
 
   /**
@@ -369,7 +413,7 @@ function createDesktopUpdater({
       if (!(await confirmControl(win, "download"))) {
         throw new Error("Update download wasn't approved for this server.");
       }
-      await autoUpdater.downloadUpdate();
+      await downloadUpdate();
     });
 
     ipcMain.handle("omnigent:update-install", async (event) => {

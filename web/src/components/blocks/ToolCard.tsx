@@ -13,6 +13,7 @@ import {
   Loader2Icon,
   Maximize2Icon,
   Minimize2Icon,
+  WrapTextIcon,
   XCircleIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -35,16 +36,11 @@ import {
   formatToolRunLabel,
   formatToolTitle,
 } from "@/lib/toolTitle";
-import { useFileViewer } from "@/shell/FileViewerContext";
+import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
 const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
-
-/**
- * Tools whose `args.path` field is a workspace file path that the user
- * should be able to click to open in the FileViewer.
- */
-const FILE_PATH_TOOLS = new Set(["sys_os_read", "sys_os_write", "sys_os_edit"]);
 
 /**
  * If the string is valid JSON, return its 2-space-indented form.
@@ -186,17 +182,14 @@ export function ToolCard({
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
 
-  // When this is a file-path tool and we're inside AppShell, make the path
-  // in the trigger row a clickable link that opens the FileViewer.
+  // Link a file tool's path to the FileViewer, resolved like chat file links.
   const openFile = useFileViewer();
-  const rawPath =
-    FILE_PATH_TOOLS.has(name) &&
-    typeof args.path === "string" &&
-    args.path.length > 0 &&
-    !args.path.startsWith("/") // FileViewer rejects absolute paths
-      ? args.path
-      : null;
-  const onBodyClick = openFile && rawPath ? () => openFile(rawPath) : undefined;
+  const { root, home } = useWorkspacePaths();
+  const linkPath =
+    title.filePath === undefined
+      ? null
+      : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
+  const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
 
   return (
     <Collapsible defaultOpen={false} className="group not-prose w-full">
@@ -400,17 +393,45 @@ function CodePanel({
   copyText: string;
   copyLabel: string;
 }) {
+  // Soft-wrap long lines by default so the panel never needs horizontal
+  // scrolling to read; the toggle restores the scrolling view for when
+  // column alignment matters (same affordance as chat code blocks).
+  const [wrap, setWrap] = useState(true);
   return (
-    <CodeBlock code={text} language="json">
+    <CodeBlock code={text} language="json" wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
         </CodeBlockTitle>
         <CodeBlockActions>
+          <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
           <CopyTextButton label={copyLabel} text={copyText} />
         </CodeBlockActions>
       </CodeBlockHeader>
     </CodeBlock>
+  );
+}
+
+function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
+  const label = wrap ? "Disable word wrap" : "Enable word wrap";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={label}
+          aria-pressed={wrap}
+          className={cn("size-6 text-muted-foreground", wrap && "text-foreground")}
+          onClick={onToggle}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+          componentId="diagnostics.tool.toggle_wrap"
+        >
+          <WrapTextIcon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 

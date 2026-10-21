@@ -7,16 +7,30 @@
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
+import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "subagents", "browser"];
+const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
+  "files",
+  "changes",
+  "github",
+  "subagents",
+];
+const RAIL_TABS: readonly RightRailTab[] = [
+  ...WORKSPACE_PANEL_TABS,
+  "browser",
+  "sidechat",
+  "content-search",
+];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected rail tab (Files / Changes / Agents). */
-  rightRailTab?: RightRailTab;
+  /** Selected Workspace page, or null when no pinned or opened page is available. */
+  rightRailTab?: RightRailTab | null;
+  /** Unpinned built-in pages explicitly opened from the Workspace menu. */
+  openPanels?: DefaultWorkspaceTab[];
   /** Ordered list of open file tabs. */
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
@@ -25,6 +39,13 @@ export interface SessionWorkspaceState {
   openTerminals?: string[];
   /** The active shell tab (null = a file/scope view is active). */
   selectedTerminalKey?: string | null;
+  openBrowsers?: string[];
+  selectedBrowserId?: string | null;
+  /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
+   *  by design: side chats are ephemeral and vanish when the app is closed. */
+  openSideChats?: string[];
+  /** The active side-chat tab (null = a file/scope/other view is active). */
+  selectedSideChatId?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -65,7 +86,18 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   const state: SessionWorkspaceState = {};
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
-  if (isRailTab(record.rightRailTab)) state.rightRailTab = record.rightRailTab;
+  if (record.rightRailTab === null || isRailTab(record.rightRailTab)) {
+    state.rightRailTab = record.rightRailTab;
+  }
+  if (Array.isArray(record.openPanels)) {
+    state.openPanels = [
+      ...new Set(
+        record.openPanels.filter((value): value is DefaultWorkspaceTab =>
+          WORKSPACE_PANEL_TABS.some((tab) => tab === value),
+        ),
+      ),
+    ];
+  }
   if (Array.isArray(record.openFiles) && record.openFiles.every((p) => typeof p === "string")) {
     state.openFiles = record.openFiles as string[];
   }
@@ -80,6 +112,30 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
     state.selectedTerminalKey = record.selectedTerminalKey;
+  }
+  if (Array.isArray(record.openBrowsers)) {
+    state.openBrowsers = [
+      ...new Set(
+        record.openBrowsers.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
+    state.selectedBrowserId = record.selectedBrowserId;
+  }
+  if (Array.isArray(record.openSideChats)) {
+    state.openSideChats = [
+      ...new Set(
+        record.openSideChats.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
+    state.selectedSideChatId = record.selectedSideChatId;
   }
   return state;
 }
@@ -136,12 +192,45 @@ export function writeSessionWorkspaceState(
   if (next.openTerminals && next.openTerminals.length > MAX_OPEN_FILES) {
     next.openTerminals = next.openTerminals.slice(-MAX_OPEN_FILES);
   }
+  // Same bound for browser tabs. Native view creation enforces its own lower
+  // runtime cap; this keeps the persisted rail from growing without bound.
+  if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
+    next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
+  }
+  // Same bound for side-chat tabs (also appended in open order).
+  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
+    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
+  }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
   if (existingIdx >= 0) store.splice(existingIdx, 1);
   store.push({ id: conversationId, state: next });
   if (store.length > MAX_SESSIONS) {
     store.splice(0, store.length - MAX_SESSIONS);
+  }
+  writeStore(store);
+}
+
+/** Let existing chats follow a changed default while keeping their open tabs and layout. */
+export function resetSessionWorkspaceTabSelections(): void {
+  const store = readStore();
+  for (const { state } of store) {
+    delete state.rightRailTab;
+    delete state.selectedFilePath;
+    delete state.selectedTerminalKey;
+    delete state.selectedBrowserId;
+    delete state.selectedSideChatId;
+  }
+  writeStore(store);
+}
+
+/** Forget newly unpinned pages without disturbing other tabs or their selection. */
+export function unpinSessionWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): void {
+  if (tabs.length === 0) return;
+  const store = readStore();
+  for (const { state } of store) {
+    if (tabs.some((tab) => tab === state.rightRailTab)) delete state.rightRailTab;
+    if (state.openPanels) state.openPanels = state.openPanels.filter((tab) => !tabs.includes(tab));
   }
   writeStore(store);
 }

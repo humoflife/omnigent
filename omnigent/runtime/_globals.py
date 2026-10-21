@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from omnigent.runtime.caps import RuntimeCaps
@@ -36,7 +37,9 @@ _file_store: FileStore | None = None
 _artifact_store: ArtifactStore | None = None
 _comment_store: CommentStore | None = None
 _policy_store: PolicyStore | None = None
-_caps: RuntimeCaps = RuntimeCaps()
+# Hosts import runtime helpers but do not need server routing configuration.
+_caps: RuntimeCaps | None = None
+_caps_lock = Lock()
 
 # Server-resident tmux terminal registry. Initialized in
 # :func:`init` and accessed via ``get_terminal_registry()`` in
@@ -164,6 +167,7 @@ class DispatchCapability:
 # child workflow that recovers on a different process will not find
 # the entry and must surface a clear error rather than silently
 # dispatching on stale state.
+# custom-lint: disable-next=workspace-scoped-cache -- process-local task_id
 _dispatch_capabilities: dict[str, DispatchCapability] = {}
 
 
@@ -220,7 +224,8 @@ def init(
     _artifact_store = artifact_store
     _comment_store = comment_store
     _policy_store = policy_store
-    _caps = caps if caps is not None else RuntimeCaps()
+    with _caps_lock:
+        _caps = caps if caps is not None else RuntimeCaps()
     # Tmux terminal registry: server-resident, conversation-scoped
     # ``inner.terminal.TerminalInstance`` map. See
     # ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §4.2 for the design.

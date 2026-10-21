@@ -10,6 +10,7 @@ lookup while stubbing the control bridge itself.
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -80,7 +81,7 @@ def _patch_control_attach(
         raise RuntimeError("bridge stopped")
 
     monkeypatch.setattr(
-        "omnigent.runner.app.bridge_tmux_control_to_websocket",
+        "omnigent.runner.resource_routes.bridge_tmux_control_to_websocket",
         fake_control,
     )
 
@@ -313,7 +314,9 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
             name="tui",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_repl_terminal", fake_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_routes._auto_create_repl_terminal", fake_auto_create
+    )
 
     attach_sockets: list[str] = []
 
@@ -411,6 +414,7 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         *,
         server_client: object,
         ensure_comment_relay: object = None,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_qwen_terminal`` that registers a
@@ -422,6 +426,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         :param server_client: Omnigent server client (unused).
         :param ensure_comment_relay: Comment relay hook threaded by the
             recreate path (unused by the stub).
+        :param agent_spec: Session agent spec threaded by the recreate path so
+            the pane inherits its ``os_env`` (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)
@@ -433,7 +439,9 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
             name="qwen",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_qwen_terminal", fake_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_routes._auto_create_qwen_terminal", fake_auto_create
+    )
 
     attach_sockets: list[str] = []
 
@@ -514,7 +522,9 @@ def test_runner_resource_attach_dead_non_repl_terminal_keeps_4404(
             "recreate path must be gated on OMNIGENT_REPL_TERMINAL_ROLE."
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_repl_terminal", must_not_recreate)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_routes._auto_create_repl_terminal", must_not_recreate
+    )
 
     with TestClient(app).websocket_connect(
         "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
@@ -695,3 +705,34 @@ async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
                 pass
     finally:
         await listener.stop()
+
+
+@pytest.mark.asyncio
+async def test_direct_attach_listener_preserves_existing_log_handlers() -> None:
+    """Starting the nested listener must not reconfigure runner logging."""
+
+    class TrackingHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.was_closed = False
+
+        def emit(self, record: logging.LogRecord) -> None:
+            pass
+
+        def close(self) -> None:
+            self.was_closed = True
+            super().close()
+
+    handler = TrackingHandler()
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    listener = None
+    try:
+        listener = await start_direct_attach_listener(_make_direct_app([]))
+        assert listener is not None
+        assert not handler.was_closed
+    finally:
+        if listener is not None:
+            await listener.stop()
+        root_logger.removeHandler(handler)
+        handler.close()

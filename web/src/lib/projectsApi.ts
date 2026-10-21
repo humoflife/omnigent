@@ -11,6 +11,7 @@
 // (`id`, `name`), so no boundary conversion is needed.
 
 import { authenticatedFetch } from "./identity";
+import { apiErrorFromResponse } from "./sessionsApi";
 
 /**
  * Default session settings a project stores, pre-filled into the new-chat
@@ -42,6 +43,14 @@ export interface ProjectConfig {
    * is never stored (treated the same as unset).
    */
   base_branch?: string;
+  /**
+   * Default model for new sessions when the default agent is a native coding
+   * harness with a model choice (e.g. Claude Code's version-agnostic "opus"
+   * alias, or a Codex model id resolved on the host). Only meaningful
+   * alongside an `agent_id` whose harness takes a model override; unset =
+   * the harness's own configured default.
+   */
+  model?: string;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
@@ -70,7 +79,7 @@ async function readError(res: Response): Promise<string> {
   }
 }
 
-/** List the caller's projects (owner-scoped), oldest first. */
+/** List the caller's projects in their preferred display order. */
 export async function listProjects(): Promise<Project[]> {
   const res = await authenticatedFetch("/v1/projects");
   if (!res.ok) throw new Error(await readError(res));
@@ -81,7 +90,7 @@ export async function listProjects(): Promise<Project[]> {
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */
 export async function getProject(id: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 
@@ -136,4 +145,25 @@ export async function deleteProject(id: string): Promise<void> {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(await readError(res));
+}
+
+export interface ProjectOrder {
+  ordered_project_ids: string[] | null;
+  sort_mode: "alphabetical" | "manual";
+}
+
+export async function getProjectOrder(): Promise<ProjectOrder> {
+  const res = await authenticatedFetch("/v1/projects/order");
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as ProjectOrder;
+}
+
+export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrder> {
+  const res = await authenticatedFetch("/v1/projects/order", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ordered_project_ids: ids }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as ProjectOrder;
 }

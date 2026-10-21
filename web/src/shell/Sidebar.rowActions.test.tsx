@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -8,14 +12,20 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { sessionActionRestrictions, type SessionActionSource } from "@/lib/sessionCapabilities";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: (_id: string, source: SessionActionSource) =>
+    sessionActionRestrictions(source),
+}));
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -53,6 +63,7 @@ const mocks = vi.hoisted(() => {
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
+    projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
@@ -70,71 +81,63 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-    variables: undefined,
-  }),
-  // Reactive server pinned set: subscribes to the hoisted store so a toggle
-  // re-renders, mapping pinned ids onto the loaded conversations.
-  usePinnedConversations: () => {
-    const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
-    const idSet = new Set(ids);
-    return {
-      data: {
-        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
-        filterHonored: true,
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => {
+      const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
+      const idSet = new Set(ids);
+      return {
+        data: {
+          conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
+    },
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
+        mocks.pinnedStore.toggle(id, pinned),
+      // Unpin goes through mutateAsync so the Undo pill waits for the write.
+      mutateAsync: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        mocks.pinnedStore.toggle(id, pinned);
+        return Promise.resolve({});
       },
-      isSuccess: true,
-    };
-  },
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      mocks.pinnedStore.toggle(id, pinned),
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => mocks.rename,
-  useLeaveSession: () => mocks.leave,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
-  // A non-empty `useProjects` renders a project folder, which queries its
-  // sessions — return the collapsed (disabled) shape so the folder is inert
-  // (this suite keeps its test row unfiled; the picker only needs the name).
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
-  useMoveToProject: () => mocks.moveToProject,
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    }),
+    useRenameConversation: () => mocks.rename,
+    useLeaveSession: () => mocks.leave,
+    useProjects: () => ({
+      data: mocks.projects.map((name: string) => ({
+        id: `p_${name}`,
+        name,
+        icon: mocks.projectIcons[name],
+      })),
+    }),
+    useProjectSessions: () => ({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    }),
+    useMoveToProject: () => mocks.moveToProject,
+  };
+});
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
 // test stays scoped to the conversation row.
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({ open, sourceSessionId }: { open: boolean; sourceSessionId: string }) =>
+    open ? (
+      <div data-testid="fork-session-dialog" data-source-session-id={sourceSessionId} />
+    ) : null,
+}));
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
@@ -202,6 +205,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -228,17 +232,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -258,6 +264,7 @@ beforeEach(() => {
   mocks.moveToProject.mutate.mockReset();
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
+  mocks.projectIcons = {};
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -303,29 +310,23 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("md:pr-14");
+    expect(rowLink).not.toHaveClass("md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("md:pr-14");
+    expect(rowLink).toHaveClass("md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
-    // The folder-header pencil + kebab share the right-edge column with the
-    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
-    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
-    // different columns and read as misaligned.
+    // Project and session menu buttons share the same compact right-edge slot.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const projectActions = screen.getByTestId("project-actions");
-    const projectNewSession = screen.getByTestId("project-new-session");
-    for (const button of [projectActions, projectNewSession]) {
-      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
-      expect(button).not.toHaveClass("size-7");
-      expect(button.querySelector("svg")).toHaveClass("size-3.5");
-      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
-    }
+    expect(projectActions).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+    expect(projectActions).not.toHaveClass("size-7");
+    expect(projectActions.querySelector("svg")).toHaveClass("size-3.5");
+    expect(projectActions.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
@@ -368,9 +369,9 @@ describe("quick pin/unpin hover button", () => {
     // Hover-capable desktop: fades out until the header is hovered / focused /
     // a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media(hover:hover)]:md:opacity-0",
-      "[@media(hover:hover)]:md:group-hover/header:opacity-100",
-      "[@media(hover:hover)]:md:has-[:focus-visible]:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
     );
   });
 
@@ -420,6 +421,17 @@ describe("quick pin/unpin hover button", () => {
     // Clicking again unpins: the Pinned section disappears.
     fireEvent.click(screen.getByTestId("quick-pin-conversation"));
     expect(screen.queryByText("Pinned")).toBeNull();
+  });
+
+  it.each([
+    ["quick-pin-conversation", "Pin"],
+    ["quick-archive-conversation", "Archive"],
+  ])("shows the %s action in a styled tooltip on hover", async (testId, label) => {
+    const user = userEvent.setup();
+    renderSidebar();
+
+    await user.hover(screen.getByTestId(testId));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
   });
 
   it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
@@ -661,6 +673,83 @@ describe("double-click to rename", () => {
   });
 });
 
+describe("rename under the iOS soft keyboard", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Stub the iOS shell on an 844px layout. The returned function raises the
+   * keyboard through UIKit's keyboard-viewport bridge or, for shells without
+   * it, through WebKit's shrinking visualViewport.
+   */
+  function stubIOSShell(source: "native" | "visualViewport"): (visibleHeight: number) => void {
+    const viewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+    let nativeViewport: { width: number; height: number } | null = null;
+    const nativeListeners = new Set<() => void>();
+    vi.stubGlobal("innerHeight", 844);
+    vi.stubGlobal("visualViewport", viewport);
+    vi.stubGlobal("omnigentNative", {
+      kind: "ios",
+      ...(source === "native" && {
+        getKeyboardViewport: () => nativeViewport,
+        onKeyboardViewportChanged: (callback: () => void) => {
+          nativeListeners.add(callback);
+          return () => nativeListeners.delete(callback);
+        },
+      }),
+    });
+    return (visibleHeight) => {
+      act(() => {
+        if (source === "native") {
+          nativeViewport = { width: window.innerWidth, height: visibleHeight };
+          nativeListeners.forEach((callback) => callback());
+        } else {
+          viewport.height = visibleHeight;
+          viewport.dispatchEvent(new Event("resize"));
+        }
+      });
+    };
+  }
+
+  it.each(["native", "visualViewport"] as const)(
+    "re-centers the focused rename field once the %s keyboard inset shrinks the list",
+    (source) => {
+      // The field focuses (raising the keyboard) while still visible; the
+      // drawer's keyboard-inset padding then shrinks the list underneath it.
+      const openKeyboard = stubIOSShell(source);
+      renderSidebar();
+      fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+      const input = screen.getByTestId("rename-conversation-input");
+      expect(input).toHaveFocus();
+      const scrollIntoView = vi.fn();
+      input.scrollIntoView = scrollIntoView;
+
+      openKeyboard(508);
+
+      expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+        paddingBottom: "336px",
+      });
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    },
+  );
+
+  it("re-centers a rename field that opens while the keyboard is already up", () => {
+    const openKeyboard = stubIOSShell("native");
+    renderSidebar();
+    openKeyboard(508);
+    const scrollIntoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+
+    const input = screen.getByTestId("rename-conversation-input");
+    expect(input).toHaveFocus();
+    expect(scrollIntoView.mock.contexts).toContain(input);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+  });
+});
+
 describe("leave a shared session", () => {
   // Every other row action is owner-only, so "Leave session" is the one thing
   // a shared-with viewer can actually do: drop the session from their own
@@ -747,11 +836,45 @@ describe("leave a shared session", () => {
   });
 });
 
+describe("quick-archive owner gate", () => {
+  // Archive is owner-only: the kebab renders its Archive item disabled for
+  // non-owners ("Only the session owner can archive this session"). The hover
+  // quick button must enforce the same gate — so a non-owner never gets the
+  // affordance the menu deliberately blocks.
+  it("hides the quick-archive button on a shared row the viewer doesn't own", () => {
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
+    renderSidebar();
+    // Non-owned rows live on the "Shared with me" tab (activates on mousedown).
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).toBeNull();
+
+    // The kebab still carries the (disabled) Archive item — the gate hides only
+    // the quick button, not the explanatory menu entry.
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByTestId("archive-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("shows the quick-archive button on a row the viewer owns", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-archive-conversation")).toBeInTheDocument();
+  });
+});
+
 describe("pinned row project flyout", () => {
   // Pinning lifts a session out of its project folder into the flat "Pinned"
   // section, so the folder no longer conveys which project it came from. The
-  // hover flyout restores that cue: title + folder icon + project name. It
-  // opens on focus/hover — fire focus on the row link and await the portal.
+  // hover flyout restores that cue: title + project icon (the project's chosen
+  // emoji, or a folder fallback) + project name. It opens on focus/hover — fire
+  // focus on the row link and await the portal.
 
   it("shows the project name in the flyout for a pinned, project-owned row", async () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
@@ -781,6 +904,46 @@ describe("pinned row project flyout", () => {
     expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
       "fix/sidebar-row-height",
     );
+  });
+
+  it("shows the project's real emoji icon in the flyout when the project has one", async () => {
+    // The flyout mirrors the folder/picker: a first-class project that carries a
+    // chosen emoji surfaces that glyph next to its name, not the generic folder.
+    // The icon is keyed off the row's first-class `project_id`, so seed one that
+    // resolves into the mocked projects list (id `p_<name>`).
+    mocks.projects = ["Moonshot"];
+    mocks.projectIcons = { Moonshot: "🚀" };
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, project_id: "p_Moonshot" }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    // The emoji renders via ProjectRowIcon (data-testid project-icon), replacing
+    // the folder svg the fallback would otherwise draw.
+    const icon = within(flyout).getByTestId("project-icon");
+    expect(icon).toHaveTextContent("🚀");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(within(flyout).queryByRole("img", { hidden: true })).toBeNull();
+  });
+
+  it("falls back to the folder icon in the flyout for a project with no emoji", async () => {
+    // A label-only project (no first-class id/icon) has no glyph to surface, so
+    // the flyout keeps the folder icon — proving the emoji path is opt-in.
+    mocks.pinnedStore.set(["conv_1"]);
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    // No emoji span; the project line leads with the folder svg fallback.
+    expect(within(flyout).queryByTestId("project-icon")).toBeNull();
+    const projectLine = within(flyout).getByText("Moonshot").closest("p")!;
+    expect(projectLine.querySelector("svg")).not.toBeNull();
   });
 
   it("renders no project flyout for a pinned row with no project", () => {
@@ -912,6 +1075,71 @@ describe("mobile in-place project picker", () => {
     expect(screen.queryByRole("menuitem", { name: /Create/ })).toBeNull();
   });
 
+  it("orders decorative project icons and a folder fallback before their names", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42", "Legacy project"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+
+    const iconRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    const emoji = iconRow.firstElementChild;
+    expect(emoji).toHaveAttribute("data-testid", "project-icon");
+    expect(emoji).toHaveAttribute("aria-hidden", "true");
+    expect(emoji).toHaveTextContent("🚀");
+    expect(emoji?.nextElementSibling).toHaveTextContent("Sprint 42");
+
+    const fallback = screen.getByRole("menuitem", { name: "Legacy project" }).firstElementChild;
+    expect(fallback?.tagName.toLowerCase()).toBe("svg");
+    expect(fallback).toHaveAttribute("aria-hidden", "true");
+    expect(fallback?.nextElementSibling).toHaveTextContent("Legacy project");
+
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    expect(removeItem.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(removeItem.firstElementChild).toHaveTextContent("🚀");
+  });
+
+  it("uses project names and the Remove label for desktop picker typeahead", async () => {
+    mocks.projects = ["Alpha", "Sprint 42"];
+    mocks.projectIcons = { "Sprint 42": "🚀" };
+    mockConversations([{ ...CONV, labels: { omni_project: "Sprint 42" } }]);
+    mocks.pinnedStore.set([CONV.id]);
+    const view = renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveTrigger = screen.getByTestId("move-to-project");
+    moveTrigger.focus();
+    fireEvent.keyDown(moveTrigger, { key: "ArrowRight" });
+
+    const alphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const sprintRow = screen.getByRole("menuitem", { name: "Sprint 42" });
+    expect(alphaRow.firstElementChild?.tagName.toLowerCase()).toBe("svg");
+    expect(alphaRow.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(alphaRow.firstElementChild?.nextElementSibling).toHaveTextContent("Alpha");
+    expect(sprintRow.firstElementChild).toHaveAttribute("data-testid", "project-icon");
+    expect(sprintRow.firstElementChild?.nextElementSibling).toHaveTextContent("Sprint 42");
+    await waitFor(() => expect(alphaRow).toHaveFocus());
+    fireEvent.keyDown(alphaRow, { key: "s" });
+    await waitFor(() => expect(sprintRow).toHaveFocus());
+
+    view.unmount();
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const freshMoveTrigger = screen.getByTestId("move-to-project");
+    freshMoveTrigger.focus();
+    fireEvent.keyDown(freshMoveTrigger, { key: "ArrowRight" });
+
+    const freshAlphaRow = await screen.findByRole("menuitem", { name: "Alpha" });
+    const removeItem = screen.getByRole("menuitem", { name: "Remove from Sprint 42" });
+    await waitFor(() => expect(freshAlphaRow).toHaveFocus());
+    fireEvent.keyDown(freshAlphaRow, { key: "r" });
+    await waitFor(() => expect(removeItem).toHaveFocus());
+  });
+
   it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
     // Desktop viewport (default). The project entry is a submenu trigger, and
     // opening the kebab never renders the in-place Back control.
@@ -985,6 +1213,40 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("keeps Fork visible but unavailable for a managed source", () => {
+    mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
+  it("opens the fork dialog for the selected session", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
+  });
+
+  it.each(["quick-pin-conversation", "quick-archive-conversation", "conversation-actions"])(
+    "opens the session menu when right-clicking the %s button",
+    (testId) => {
+      renderSidebar();
+
+      expect(fireEvent.contextMenu(screen.getByTestId(testId))).toBe(false);
+
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    },
+  );
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
@@ -1190,11 +1452,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

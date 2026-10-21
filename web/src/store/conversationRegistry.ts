@@ -8,6 +8,7 @@
 // on revisit is a transcript cache in a different shape, which is what keeping
 // streams open replaces. Live-or-gone is the simplification.
 
+import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import type { ConversationState } from "./chatStore";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 
@@ -74,7 +75,12 @@ function readNextHopProtocol(): string | null {
 export function maxLiveConversations(
   protocol: ConnectionProtocol = getConnectionProtocol(),
 ): number {
-  return protocol === "multiplexed" ? 30 : 3;
+  // Four grid panes leave two HTTP/1.1 connections available for ordinary requests.
+  return protocol === "multiplexed"
+    ? 30
+    : isFeatureEnabled(getCachedServerInfo() ?? "loading", "grid_sessions_display_ui")
+      ? 4
+      : 3;
 }
 
 /** Writes a patch into a conversation's state. Mirrors zustand's `setState`. */
@@ -121,6 +127,17 @@ export class ConversationRegistry {
   private readonly disposeListeners = new Set<DisposeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
+  private readonly retainedIds = new Map<string, number>();
+
+  /** Keep a visible secondary pane live until its owner unmounts. */
+  retain(id: string): () => void {
+    this.retainedIds.set(id, (this.retainedIds.get(id) ?? 0) + 1);
+    return () => {
+      const count = this.retainedIds.get(id) ?? 0;
+      if (count <= 1) this.retainedIds.delete(id);
+      else this.retainedIds.set(id, count - 1);
+    };
+  }
 
   /**
    * Subscribe to state changes across all entries.
@@ -217,6 +234,45 @@ export class ConversationRegistry {
     for (const entry of [...this.entries.values()]) entry.dispose();
     this.entries.clear();
     this.activeId = null;
+    this.retainedIds.clear();
+  }
+
+  /**
+   * Rename an entry `oldId` → `newId`, preserving its state — hydrates a
+   * client-only conversation (`temp:*`) onto its real id so the optimistic
+   * bubble carries over without a remount. `oldId` must be a stream-less local
+   * entry (no live SSE pump to transfer). If `newId` is already live, its entry
+   * wins but inherits any optimistic pending messages before the old one is
+   * disposed. No-op if `oldId` isn't live.
+   */
+  rekey(oldId: string, newId: string): void {
+    const old = this.entries.get(oldId);
+    if (old === undefined) return;
+    if (oldId === newId) return;
+    const existing = this.entries.get(newId);
+    if (existing !== undefined) {
+      const existingState = existing.getState();
+      const existingPendingIds = new Set(
+        existingState.pendingUserMessages.map((item) => item.tempId),
+      );
+      const missingPending = old
+        .getState()
+        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
+      if (missingPending.length > 0) {
+        existing.setState({
+          pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+        });
+      }
+      this.release(oldId);
+      if (this.activeId === oldId) this.activeId = newId;
+      return;
+    }
+    const next = this.createEntry(newId);
+    next.setState(old.getState());
+    this.entries.set(newId, next);
+    this.entries.delete(oldId);
+    old.dispose();
+    if (this.activeId === oldId) this.activeId = newId;
   }
 
   /** Move `id` to the most-recently-viewed end of the LRU order. */
@@ -244,7 +300,7 @@ export class ConversationRegistry {
    */
   evictLruEvictable(exemptId?: string): string | null {
     for (const [id, entry] of this.entries) {
-      if (id === this.activeId || id === exemptId) continue;
+      if (id === this.activeId || id === exemptId || this.retainedIds.has(id)) continue;
       if (hasUnsentWork(entry.getState())) continue;
       this.entries.delete(id);
       entry.dispose();

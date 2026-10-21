@@ -52,7 +52,12 @@ from ._child_status import (
     child_summary_busy,
 )
 from ._client import OmnigentClient
-from ._errors import OmnigentError, ToolCallDenied
+from ._errors import (
+    OmnigentError,
+    RateLimitedError,
+    StaleCursorError,
+    ToolCallDenied,
+)
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
 from ._query import QueryResult, QueryStream
 from ._server import LocalServer
@@ -73,7 +78,7 @@ from ._transforms import (
     skip_blocks,
     skip_intermediate_ends,
 )
-from ._types import File
+from ._types import File, PaginatedList
 from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
@@ -92,8 +97,10 @@ __all__ = [
     "NativeToolBlock",
     "OmnigentClient",
     "OmnigentError",
+    "PaginatedList",
     "QueryResult",
     "QueryStream",
+    "RateLimitedError",
     "ReasoningBlock",
     "ReasoningChunk",
     "ReasoningStartBlock",
@@ -105,6 +112,7 @@ __all__ = [
     "SessionToolCallInfo",
     "SessionsChat",
     "SessionsNamespace",
+    "StaleCursorError",
     "StreamBlock",
     "StreamHooks",
     "TextChunk",

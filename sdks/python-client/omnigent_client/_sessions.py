@@ -26,7 +26,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import TypeAdapter
@@ -34,8 +34,9 @@ from pydantic import TypeAdapter
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
-from ._errors import raise_for_status, require_json_object, response_body
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
+from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -127,9 +128,7 @@ class Session:
     :param agent_id: Durable identifier of the bound agent, e.g.
         ``"ag_abc123"``. Stable across renames of the agent.
     :param agent_name: Human-readable name of the bound agent, e.g.
-        ``"polly"``. Changes when the session is switched to a
-        different agent in place (``POST .../switch-agent``), so
-        attached clients can refresh their displayed agent label.
+        ``"polly"``.
         ``None`` when the server couldn't resolve the agent row.
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.
@@ -179,8 +178,9 @@ class Session:
         conversations.
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``list`` listing and
-        returned only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        returned with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
     """
 
     id: str
@@ -258,6 +258,11 @@ class SessionListItem:
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
+    :param host_id: Host that launched the runner for this session,
+        or ``None`` for sessions without a host binding (e.g. a
+        caller-managed runner). Native resume pickers rely on it to
+        drop rows bound to other hosts, whose runtime state is not
+        reachable from the invoking machine.
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param owner: User ID of the session owner.
     :param external_session_id: Runtime-native session id this
@@ -270,8 +275,11 @@ class SessionListItem:
         running can tell which ones are blocked on them. ``0`` when
         the session has no outstanding prompts.
     :param archived: Whether the session is archived. Returned by
-        ``list`` only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        ``list`` with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
+    :param parent_session_id: Parent session for a sub-agent child; ``None``
+        for top-level sessions or when omitted by an older server.
     """
 
     id: str
@@ -282,11 +290,13 @@ class SessionListItem:
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
+    host_id: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
+    parent_session_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -307,11 +317,13 @@ class SessionListItem:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
+            parent_session_id=raw.get("parent_session_id"),
         )
 
 
@@ -487,11 +499,15 @@ class SessionsNamespace:
         not resolvable this way and raises ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
-        still resolves.
+        still resolves. The only quiet end of the walk is the server
+        reporting ``has_more`` false; a stalled listing raises instead
+        of masquerading as a clean miss.
 
         :param agent_name: Agent display name, e.g. ``"hello_world"``.
         :returns: The matching agent's id and advertised harness.
-        :raises OmnigentError: If the listing returns a non-2xx status.
+        :raises OmnigentError: If the listing returns a non-2xx status,
+            or reports ``has_more`` with a missing or non-advancing
+            ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
         # Cap the miss-path name list: a large deployment should not
@@ -526,8 +542,22 @@ class SessionsNamespace:
                 break
             last_id = listing.get("last_id")
             if not last_id:
-                break
-            after = str(last_id)
+                # Server reports more pages but provides no cursor to advance
+                # — raise rather than silently stopping, so callers can
+                # distinguish a pagination stall from "agent not found".
+                raise OmnigentError(
+                    f"agent listing stalled: server returned has_more=True but"
+                    f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
+                )
+            next_after = str(last_id)
+            if next_after == after:
+                # A cursor that does not advance would page forever; raise
+                # instead of looping on the same page.
+                raise OmnigentError(
+                    f"agent listing stalled: server repeated cursor {next_after!r}"
+                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
+                )
+            after = next_after
         available = ", ".join(names) + (", …" if truncated else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
@@ -600,6 +630,8 @@ class SessionsNamespace:
         order: str = "desc",
         sort_by: str = "created_at",
         include_archived: bool = False,
+        visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        kind: Literal["default", "sub_agent", "any"] | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -619,13 +651,31 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: When ``False`` (default), archived
-            sessions are omitted. When ``True``, archived sessions are
-            returned alongside active ones.
+        :param include_archived: With ``visibility="all"``, include
+            archived sessions alongside active ones when ``True``.
+            Defaults to ``False``. Other visibility modes determine
+            archive filtering themselves.
+        :param visibility: ``"all"`` (default) returns all accessible
+            sessions. ``"mine"`` returns owned active sessions, and
+            ``"shared"`` returns accessible active sessions not owned
+            by the caller. ``"archived"`` returns only archived sessions.
+            Without server authentication, ``"mine"`` and ``"shared"``
+            behave like ``"all"``. Always sent explicitly to the server.
+        :param kind: ``"default"`` returns top-level sessions,
+            ``"sub_agent"`` returns children, and ``"any"`` includes both.
+            ``None`` leaves the server's top-level-only default unchanged.
         :returns: List of :class:`SessionListItem`.
+        :raises StaleCursorError: If ``after``/``before`` names a session
+            that has since been deleted. The walk cannot continue from
+            that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
-        params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
+        params: dict[str, str | int] = {
+            "limit": limit,
+            "order": order,
+            "sort_by": sort_by,
+            "visibility": visibility,
+        }
         if after is not None:
             params["after"] = after
         if before is not None:
@@ -636,6 +686,8 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        if kind is not None:
+            params["kind"] = kind
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,
@@ -786,9 +838,10 @@ class SessionsNamespace:
 
         Calls ``PATCH /v1/sessions/{session_id}`` with
         ``{"archived": ...}``. Archived sessions are hidden from the
-        default :meth:`list` listing and surfaced only with
-        ``include_archived=True``. Owner-only (the web UI stops the
-        session on archive, an owner-gated lifecycle action, so archive
+        default :meth:`list` listing and surfaced with
+        ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. Owner-only (the web
+        UI stops the session on archive, an owner-gated lifecycle action, so archive
         is held to the same gate); note this method only flips the
         archived flag — it does not stop the session.
 
@@ -850,7 +903,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> builtins.list[dict[str, Any]]:
+    ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
 
@@ -864,7 +917,12 @@ class SessionsNamespace:
         :param after: Cursor — return items after this item ID.
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
-        :returns: List of conversation item dicts.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
+        :raises StaleCursorError: If ``after`` names an item that has since
+            been deleted. The walk cannot continue from that cursor —
+            restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
@@ -877,15 +935,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        data = body.get("data", [])
-        return data if isinstance(data, list) else []
+        return PaginatedList.from_dict(body)
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> builtins.list[dict[str, Any]]:
+        after: str | None = None,
+    ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -900,19 +958,23 @@ class SessionsNamespace:
             e.g. ``"conv_parent123"``.
         :param limit: Maximum number of children to return
             (1-1000, default 100).
-        :returns: List of child-session summary dicts (empty when the
-            session has no sub-agents).
+        :param after: Cursor — return children after this session ID.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
+        params: dict[str, str | int] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}/child_sessions",
-            params={"limit": limit},
+            params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        data = body.get("data", [])
-        return data if isinstance(data, list) else []
+        return PaginatedList.from_dict(body)
 
     async def child_sessions_tree(
         self,
@@ -948,8 +1010,8 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                rows = await self.child_sessions(parent_id, limit=limit)
-                for row in rows:
+                page = await self.child_sessions(parent_id, limit=limit)
+                for row in page.data:
                     if not isinstance(row, dict):
                         continue
                     sid = row.get("id")
@@ -1226,6 +1288,10 @@ async def _stream_session_events(
         to subscribe to, e.g. ``"conv_abc123"``.
     :yields: :class:`ServerStreamEvent` envelopes parsed from the SSE
         ``data:`` payload.
+    :raises OmnigentError: If the stream open fails with a non-2xx
+        status, including a redirect that was not followed.
+    :raises httpx.TooManyRedirects: If on-origin redirects loop past
+        httpx's limit.
     """
     async with http.stream(
         "GET",
@@ -1235,6 +1301,17 @@ async def _stream_session_events(
         if resp.status_code >= 400:
             await resp.aread()
             raise_for_status(resp.status_code, response_body(resp))
+        elif 300 <= resp.status_code < 400:
+            # OmnigentClient follows redirects, so a 3xx here was not
+            # followable (no Location header, a 304, or a caller-supplied
+            # client with redirects disabled). Parsing its non-SSE body
+            # would yield a silent, error-free, empty stream — fail loud
+            # instead.
+            raise OmnigentError(
+                f"stream open returned a 3xx response (status {resp.status_code}) "
+                "instead of an event stream",
+                resp.status_code,
+            )
 
         async for event in _parse_sse_lines(resp.aiter_lines()):
             yield event

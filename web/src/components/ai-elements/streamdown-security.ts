@@ -33,7 +33,8 @@ export const STREAMDOWN_PLUGINS = {
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);
 
-// Attribute carrying the original, unhardened href of a workspace-file link.
+// Attribute carrying the workspace path a file link names, percent-decoded
+// from its (unhardened) href so it matches the real filename on disk.
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 
 // An href that can only be a protocol URL, a protocol-relative URL, or an
@@ -41,6 +42,29 @@ export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 // lookahead keeps a cited position off the scheme branch: `notes.md:12` is a
 // filename plus a line number, but is otherwise shaped exactly like a scheme.
 const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+)?$)|\/\/|#)/;
+const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+))?$/;
+const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?\d+(?:C\d+)?)?$/i;
+
+export interface WorkspaceFileCitation {
+  path: string;
+  line: number | null;
+  column?: number;
+  hasPosition: boolean;
+}
+
+/** Splits the line target from a local-file citation, preserving its path. */
+export function splitWorkspaceFileCitation(text: string): WorkspaceFileCitation {
+  const match = text.match(COLON_POSITION_SUFFIX) ?? text.match(HASH_POSITION_SUFFIX);
+  if (!match || match.index === undefined) return { path: text, line: null, hasPosition: false };
+  const line = Number(match[1]);
+  const column = Number(match[2]);
+  return {
+    path: text.slice(0, match.index),
+    line: Number.isSafeInteger(line) && line > 0 ? line : null,
+    ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}),
+    hasPosition: true,
+  };
+}
 
 // Where a file link's href is parked once the path moves to the data
 // attribute. Must be a *named* fragment: harden passes a fragment-only href
@@ -57,12 +81,68 @@ interface HastElement {
 
 // Streamdown enables a link-safety confirmation modal by default: clicking any
 // markdown link pops an "Open external link?" dialog instead of following the
-// link. Disable it so the renderer can use native anchors without an extra
-// confirmation click. ChatMarkdown owns the final target: non-Electron links
-// use `_self` (native shells may still intercept off-origin activation), while
-// Electron keeps `_blank` so its main-process popup and external-protocol
-// policy remains on the navigation path.
+// link. Disable it so chat links behave like ordinary links — a plain click
+// opens them and cmd/ctrl-click opens a new tab. With safety off Streamdown
+// still renders the anchor as `<a target="_blank" rel="noreferrer">`, so we
+// keep new-tab opening plus referrer/reverse-tabnabbing protection without the
+// extra confirmation click.
 export const CHAT_LINK_SAFETY: LinkSafetyConfig = { enabled: false };
+
+/** Preserves local file URIs and basename citations through sanitization. */
+export function rewriteFileUriLinks() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      if (node.tagName !== "a") return;
+      const href = node.properties?.href;
+      if (typeof href !== "string") return;
+      // A basename citation looks like a URL scheme to sanitize (README.md:12).
+      const citation = splitWorkspaceFileCitation(href);
+      if (citation.line && /^[^:?#]+\.[\w-]+$/.test(citation.path)) {
+        node.properties = {
+          ...node.properties,
+          href: `${citation.path}#L${citation.line}${citation.column ? `C${citation.column}` : ""}`,
+        };
+        return;
+      }
+      if (!/^file:/i.test(href)) return;
+      const path = fileUriToLocalPath(href);
+      if (!path) return;
+      node.properties = { ...node.properties, href: path };
+    });
+  };
+}
+
+/**
+ * Returns a local absolute path only when rewriting preserves href meaning.
+ *
+ * The path is returned still percent-encoded, exactly as any other markdown
+ * destination arrives, so that {@link markWorkspaceFileLinks} decodes every
+ * file link once. Decoding here as well would turn a file literally named
+ * `report%20final.md` (linked as `report%2520final.md`) into `report final.md`.
+ */
+function fileUriToLocalPath(href: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "file:" || url.hostname || url.search) return null;
+  // Validate the decoded form: that is the path the FileViewer will open.
+  let path: string;
+  try {
+    path = decodeURIComponent(url.pathname);
+  } catch {
+    return null;
+  }
+  // Keep the rewritten href absolute without introducing URL delimiters.
+  if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
+    return null;
+  }
+  if (!url.hash) return url.pathname;
+  const cited = splitWorkspaceFileCitation(`${path}${url.hash}`);
+  return cited.hasPosition ? `${url.pathname}${url.hash}` : null;
+}
 
 /**
  * Moves the href of every file-path link onto {@link WORKSPACE_FILE_LINK_ATTR}
@@ -81,6 +161,12 @@ export const CHAT_LINK_SAFETY: LinkSafetyConfig = { enabled: false };
  * unresolvable URL. Only hrefs that could name a real file are moved: a URL,
  * a `mailto:`/`javascript:` scheme, or anything carrying a query or fragment
  * is left for harden to judge exactly as before.
+ *
+ * This pass owns percent-decoding: the stored path is decoded exactly once,
+ * here, whether the href came straight from markdown (`My%20Notes.md`) or was
+ * handed over still encoded by {@link rewriteFileUriLinks}. The citation
+ * suffix is split off first and only the filename is decoded, so an encoded
+ * delimiter in a filename is never read back as a line citation.
  */
 export function markWorkspaceFileLinks() {
   return (tree: HastElement) => {
@@ -88,14 +174,33 @@ export function markWorkspaceFileLinks() {
       if (node.tagName !== "a") return;
       const href = node.properties?.href;
       if (typeof href !== "string" || !href) return;
-      if (NON_FILE_HREF.test(href) || href.includes("?") || href.includes("#")) return;
+      if (NON_FILE_HREF.test(href) || href.includes("?")) return;
+      const cited = splitWorkspaceFileCitation(href);
+      if (href.includes("#") && !cited.hasPosition) return;
       node.properties = {
         ...node.properties,
         href: PARKED_FILE_HREF,
-        [WORKSPACE_FILE_LINK_ATTR]: href,
+        [WORKSPACE_FILE_LINK_ATTR]: decodeFilePath(cited.path) + href.slice(cited.path.length),
       };
     });
   };
+}
+
+/**
+ * Decodes the filename unless decoding fails or creates citation syntax. A
+ * lone `%` is a legal filename character, so a malformed sequence keeps the raw
+ * text rather than dropping the link. The opener re-parses citations, so an
+ * ambiguous name (`report.md%23L12`) must stay encoded to avoid opening a
+ * sibling file.
+ */
+function decodeFilePath(path: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+  return splitWorkspaceFileCitation(decoded).hasPosition ? path : decoded;
 }
 
 function visitElements(node: HastElement, visitor: (node: HastElement) => void): void {
@@ -122,8 +227,15 @@ function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
 
 function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehypePlugins {
   const plugins: StreamdownRehypePlugins = [];
+  let sawSanitize = false;
 
   for (const [key, plugin] of Object.entries(defaultRehypePlugins)) {
+    // Preserve local file URIs and line citations before sanitization.
+    if (key === "sanitize") {
+      sawSanitize = true;
+      if (markFileLinks) plugins.push(rewriteFileUriLinks);
+    }
+
     if (key !== "harden") {
       plugins.push(plugin);
       continue;
@@ -144,6 +256,10 @@ function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehype
       plugin[0],
       { ...plugin[1], allowedImagePrefixes: [] },
     ] satisfies StreamdownPluginTuple);
+  }
+
+  if (markFileLinks && !sawSanitize) {
+    throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
 
   return plugins;

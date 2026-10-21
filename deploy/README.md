@@ -90,8 +90,14 @@ deploy/
 ├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
 │   └── README.md         E2B template); NOT a server deploy target.
 │
+├── gensee/            ← Gensee managed sandbox-provider guide (ephemeral
+│   └── README.md         provider-managed runtimes); NOT a server deploy target.
+│
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
+│
+├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
+│   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
@@ -127,7 +133,7 @@ deploy/
 > **On Databricks?** The fully managed
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) is the recommended path: Databricks operates the server for
-> you, wired to workspace identity, Foundation Models, AI Gateway, and
+> you, wired to workspace identity, Foundation Models, Unity Gateway, and
 > MLflow Tracing. Enable the **Omnigent** preview in your workspace
 > settings. The self-managed Databricks Apps bundle above is for when
 > you need control the managed service does not expose yet.
@@ -248,6 +254,55 @@ or a workspace API path) all work with the same command; for Databricks it
 runs `databricks auth login` against the right workspace for you (requires
 the `databricks` extra).
 
+### OIDC login client upgrades
+
+OIDC ticket login requires PKCE and explicit browser approval. This is a
+breaking change for older CLIs, mobile apps, Slack integrations, and custom
+clients: their next login cannot complete until they are updated. Existing
+sessions and refresh grants keep their normal expiry and revocation behavior.
+Browser-only login and the other authentication modes are unchanged.
+
+An old client's empty login request opens an **Update Omnigent to sign in**
+page. CLI users should run `omni upgrade` and retry their login; mobile users
+should update the app through their normal distribution channel; Slack users
+need their administrator to update the integration. The terminal or Slack
+message may still say the login was rejected because installed old clients
+do not display the server's detailed error text.
+Update the centrally managed Slack bot before the server: its old error modal
+can replace the upgrade link before the user opens it.
+
+The server returns HTTP 200 only to let these clients open the instructions.
+Its `ticket` field is a fixed, non-redeemable notice marker: no login ticket
+or credentials are created, and polling returns terminal HTTP 410. Requests
+containing invalid PKCE data still return HTTP 400. There is no legacy login
+fallback.
+
+Before deploying the server, make client builds containing the PKCE update
+available through your CLI, mobile, and Slack distribution channels, and
+announce that older clients must upgrade to sign in again. Test both an old
+and an updated client against a staging server with your actual identity
+provider. The old client must show the upgrade page without signing in; the
+updated client must complete fresh sign-in and browser approval. Preserve
+PKCE and consent enforcement if rolling back an unrelated deployment issue.
+
+Updated clients send proof in `X-Omnigent-Code-Verifier`; proxies must forward
+this header without logging it. Query-based proof remains supported for API
+compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
+and verifier together can redeem an approved login. Approval requires a browser
+session authenticated for that specific ticket; ordinary browser sessions,
+runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
+remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
+and a signed ID token with `auth_time` at or after the reauthentication request.
+Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
+but still requires ticket-specific browser sign-in and approval.
+Polling responses forbid caching, including successful credential responses.
+CLI and Slack display a comparison code; native mobile apps currently rely
+on explicit browser approval without displaying that code in the app. Include
+the actual native apps in staging checks before publishing a mobile build.
+
+### Register the host
+
 Then register the machine as a host, so sessions created in the web UI can
 run on it:
 
@@ -281,8 +336,8 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
-session with `"host_type": "managed"` (e.g.
+**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+*managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
 No laptop, no CLI steps per session; the sandbox is terminated when the
@@ -293,15 +348,31 @@ config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`):
 sandbox:
   provider: modal
   server_url: https://your-host        # public URL sandboxes dial back to
+  reaper:                              # optional, disabled by default
+    enabled: true
+    terminate_after_offline_days: 30   # default: 30 days
+    sweep_interval_s: 86400            # default: 1 day
 ```
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
+Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
+Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
+Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
+[`gensee/README.md`](gensee/README.md) for its managed-only configuration.
+All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
-**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. To use a custom image instead, build the same `host` target and point the provider config at it:
+The optional reaper runs once for the whole `sandbox:` deployment, including
+multi-provider configurations. It queries managed host rows directly and
+detaches a sandbox generation only after its host has stayed offline past
+`terminate_after_offline_days`. Provider termination failures remain recorded
+for a later sweep, while the session history and durable host binding stay
+available for a fresh sandbox generation. Both
+`terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
+
+**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
 ```bash
 docker build -f docker/Dockerfile --target host \
@@ -398,6 +469,63 @@ overrides this auto-selection.
 > `403` even though the host connects. Framework-level; applies to every sandbox
 > provider (Modal / Daytona / Islo / Kubernetes / …).
 
+### Ending accounts sessions
+
+An `accounts` session lasts `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` (default 8).
+To end one user's sessions sooner, change the password (Account menu → Change
+password) or have an admin reset it (Members → Reset). Either one invalidates
+the browser sessions, CLI logins, refresh tokens, and unused sign-in links
+issued to that user so far. A password change keeps the browser that made it
+signed in.
+
+The user's scheduled tasks and host registrations are kept, but that does not
+mean they keep running. A host that is already connected keeps its connection,
+and still looks online, but launches on it fail, including scheduled runs,
+until it reconnects:
+
+- A host signed in with the user's credentials (`omnigent host` after
+  `omnigent login`) cannot reconnect with them. Run `omnigent login`, then
+  restart the host.
+- A managed host, which the server starts in a sandbox, connects with its own
+  launch token rather than the user's credentials. It needs no login: once it
+  reconnects with that token, before the token expires, launches work again.
+
+CLIs need `omnigent login` too.
+
+Servers running a release without this behaviour keep the user's sessions when
+they change or reset a password. During a rolling upgrade, repeat a change made
+while such instances were still serving.
+
+Rotating `OMNIGENT_ACCOUNTS_COOKIE_SECRET` signs out every user at once: it
+invalidates all session tokens, CLI logins, and refresh tokens. Unused sign-in
+and invite links are looked up by value, not signed with the secret, so they
+keep working until they expire (sign-in links after
+`OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES`, default 10; invites after
+`OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS`, default 72).
+
+### Browser origin allowlist
+
+Independent of the auth mode above, the server also checks the browser
+`Origin` header on WebSocket handshakes and file-upload POSTs — the only
+signal that tells the user's own web UI apart from some other page open in
+the same browser. Set `OMNIGENT_WS_ALLOWED_ORIGINS` (comma-separated) to
+trust origins beyond the server's own host, e.g. when the web UI is reached
+through a proxy, tunnel, or a domain the server doesn't know about itself.
+
+An entry's host may start with `*.` to trust every subdomain of a domain in
+one entry, instead of listing each hostname individually — useful when many
+or rotating subdomains all serve the same deploy (per-workspace subdomains,
+preview environments, a tunnel provider's generated hostnames, …):
+
+```dotenv
+OMNIGENT_WS_ALLOWED_ORIGINS=https://*.example.com
+```
+
+This matches `https://foo.example.com` and `https://a.b.example.com` (any
+subdomain depth), but not the bare `https://example.com` itself. See
+[`tailscale/README.md`](tailscale/README.md) for a worked example
+using Tailscale's per-device hostnames.
+
 ### Single sign-on (OIDC)
 
 The built-in `accounts` flow needs no setup beyond the deploy itself. To let
@@ -420,6 +548,12 @@ docker compose up -d        # restart to apply
 
 Your team signs in with their existing accounts, and there are no passwords
 for you to manage. Nothing else about the app changes.
+
+Generic OIDC also supports public PKCE clients without a client secret,
+PS256-signed identity tokens, and operator-configured authorization/token/JWKS
+endpoints. See [public clients and explicit endpoints](docker/README.md#public-pkce-clients-and-explicit-endpoints)
+for configuration and security considerations. Existing client-secret login
+remains the default.
 
 > [!TIP]
 > The only outside step is creating an app with your provider (e.g. Google
@@ -508,6 +642,7 @@ start.
 ```yaml
 branding:
   app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  server_name: "Acme Engineering"  # this server's name in the desktop app's server list
   heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
   logo:                          # a bare string sets `main`; or per-variant:
     main: logo.png               # branding-assets/logo.png
@@ -531,6 +666,13 @@ sign-in. Any unset field keeps its built-in default, so a partial block is fine.
 The small "Powered by Omnigent" credit under the landing composer appears only
 once you set custom branding; `powered_by: false` hides it even then. It always
 shows the Omnigent mascot, never your logo.
+
+`server_name` names this particular server, so people who connect the desktop
+app to several servers can tell them apart. It is published in the
+unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
+Desktop builds that read it always show the host next to it, and an MDM-provided
+name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+host; it does not fall back to `app_name`.
 
 ## Adding a new deploy target
 

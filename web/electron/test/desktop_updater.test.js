@@ -31,6 +31,7 @@ const PINNED_ORIGIN = "https://server.example";
  * @param {Record<string, unknown>} [opts.settings] Initial persisted settings.
  * @param {boolean} [opts.isPackaged] Simulate a packaged build.
  * @param {boolean} [opts.forceDevUpdateConfig] Enable the development update config.
+ * @param {boolean} [opts.updatesEnabled] Whether this build may use the update feed.
  * @param {boolean} [opts.pinnedSender] Whether IPC calls count as trusted.
  * @param {Array<{response: number}>} [opts.dialogResponses] Queued dialog answers.
  * @param {() => string} [opts.getCurrentVersion] Display-version override.
@@ -39,6 +40,7 @@ function makeUpdater({
   settings = {},
   isPackaged = false,
   forceDevUpdateConfig = false,
+  updatesEnabled = true,
   pinnedSender = true,
   dialogResponses = [{ response: 1 }],
   getCurrentVersion,
@@ -110,6 +112,7 @@ function makeUpdater({
     pinnedOrigin: () => PINNED_ORIGIN,
     iconPath: "/icons/icon.png",
     forceDevUpdateConfig,
+    updatesEnabled,
     getCurrentVersion,
   };
 
@@ -261,7 +264,22 @@ describe("desktop_updater — event wiring + broadcast", () => {
   });
 });
 
-describe("desktop_updater — manual check errors", () => {
+describe("desktop_updater — check errors", () => {
+  it("restores the prior state after a background check fails", async () => {
+    const h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "start" } });
+    h.autoUpdater.checkForUpdates = () => {
+      const err = new Error("background feed unavailable");
+      h.autoUpdater.emit("checking-for-update");
+      h.autoUpdater.emit("error", err);
+      return Promise.reject(err);
+    };
+
+    h.updater.init();
+    await Promise.resolve();
+
+    assert.deepEqual(plain(h.updater.getStatus()), { state: "idle" });
+  });
+
   it("surfaces manual check failures without a false available/none flip", async () => {
     const h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "manual" } });
     h.updater.init();
@@ -292,7 +310,65 @@ describe("desktop_updater — manual check errors", () => {
   });
 });
 
+describe("desktop_updater — downloads", () => {
+  it("preserves a downloaded update instead of re-checking", async () => {
+    const h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "manual" } });
+    h.updater.init();
+    h.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+
+    await h.updater.checkForUpdates({ manual: true });
+    h.autoUpdater.emit("checking-for-update");
+    h.autoUpdater.emit("update-not-available");
+
+    assert.equal(h.calls.checkForUpdates ?? 0, 0);
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "downloaded",
+      currentVersion: "0.3.0",
+      info: { version: "0.4.0" },
+    });
+  });
+
+  it("broadcasts a cached 0% state as soon as downloading starts", async () => {
+    const h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "manual" } });
+    h.updater.init();
+    let finishDownload;
+    h.autoUpdater.downloadUpdate = () =>
+      new Promise((resolve) => {
+        finishDownload = resolve;
+      });
+
+    const download = h.updater.downloadUpdate();
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "downloading",
+      progress: { percent: 0 },
+    });
+
+    finishDownload();
+    await download;
+  });
+
+  it("leaves downloading state and exposes a retryable error", async () => {
+    const h = makeUpdater({ forceDevUpdateConfig: true, settings: { update_mode: "manual" } });
+    h.updater.init();
+    h.autoUpdater.emit("download-progress", { percent: 42 });
+    h.autoUpdater.downloadUpdate = () => Promise.reject(new Error("download interrupted"));
+
+    await assert.rejects(h.updater.downloadUpdate(), /download interrupted/);
+    assert.deepEqual(plain(h.updater.getStatus()), {
+      state: "idle",
+      lastError: "download interrupted",
+    });
+  });
+});
+
 describe("desktop_updater — development update config gating", () => {
+  it("does not offer production updates to a packaged dev build", async () => {
+    const h = makeUpdater({ isPackaged: true, updatesEnabled: false });
+    h.updater.init();
+    assert.equal(h.calls.checkForUpdates ?? 0, 0);
+    await assert.rejects(h.updater.checkForUpdates({ manual: true }), /unavailable in development/);
+  });
+
   it("blocks manual paths when the feed is unavailable in development", async () => {
     const h = makeUpdater({ settings: { update_mode: "manual" } });
     h.updater.registerIpc();

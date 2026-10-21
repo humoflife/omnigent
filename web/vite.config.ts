@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
+import { validateHeaderName, validateHeaderValue } from "node:http";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 import { shikiManualChunk } from "./vite.shiki";
+import { streamdownManualChunk } from "./vite.streamdown";
 
 // Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
 // path; a local / self-hosted server mounts at the root. Mirrors the Python
@@ -98,26 +100,45 @@ function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOpti
 function createProxyConfig(target: string, useAuth: boolean): Record<string, ProxyOptions> {
   const origin = new URL(target).origin;
   const configure = configureProxy(target, useAuth);
+  const byOrigin = JSON.parse(process.env.OMNIGENT_PROXY_HEADERS || "{}");
+  if (!byOrigin || typeof byOrigin !== "object" || Array.isArray(byOrigin)) {
+    throw new Error("OMNIGENT_PROXY_HEADERS must be a JSON object keyed by server origin");
+  }
+  const headers = byOrigin[origin] === undefined ? {} : byOrigin[origin];
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    throw new Error("OMNIGENT_PROXY_HEADERS entries must be header objects");
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    validateHeaderName(name);
+    if (typeof value !== "string") {
+      throw new Error("OMNIGENT_PROXY_HEADERS header values must be strings");
+    }
+    validateHeaderValue(name, value);
+  }
 
   return {
     "/v1": {
       target: origin,
+      headers,
       changeOrigin: true,
       ws: true,
       configure,
     },
     "/api": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
     "/auth": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
     "/health": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
@@ -128,6 +149,7 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
     // "pre-manifest", making the capability invisible in local development.
     "/.well-known": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
@@ -164,8 +186,6 @@ if (useAuth) {
 } else {
   console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
 }
-
-const proxyConfig = createProxyConfig(OMNIGENT_URL, useAuth);
 
 // Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
 // otherwise throw there, at module scope during boot or on the first rendered
@@ -216,7 +236,16 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Relative asset base for production builds so the SPA can be served under
+  // any path prefix (e.g. code-server's `/proxy/6767/`), decided purely at
+  // server runtime via OMNIGENT_WEB_BASE_PATH — no separate build needed per
+  // deployment. Dynamic code-split chunks and the Monaco worker then resolve
+  // relative to `import.meta.url` instead of a hardcoded `/assets/...`. The
+  // server rewrites the entry/asset refs in `index.html` to absolute
+  // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
+  // omnigent/server/app.py). Dev (`vite serve`) stays at root.
+  base: command === "build" ? "./" : "/",
   plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
     alias: {
@@ -248,6 +277,13 @@ export default defineConfig({
         "src/**/*StoryFixtures.{ts,tsx}",
         // Vendored UI kit, not product code (see tests/e2e_ui/COVERAGE_GAPS.md).
         "src/components/ai-elements/**",
+        // Onboarding wizard pieces with no jsdom-testable logic: the WebGL2
+        // shader + its canvas wrapper (no GL context in jsdom) and the Electron
+        // entry (createRoot against the preload bridge). The flow's real logic
+        // (steps, URL normalization) stays counted and is unit-tested.
+        "src/components/onboarding/PixelBlast.tsx",
+        "src/components/onboarding/AnimatedOmnigentPanel.tsx",
+        "src/server-selector-v2.tsx",
       ],
       reportsDirectory: "./coverage",
       // text-summary: human-readable console line; json-summary: machine-
@@ -256,7 +292,7 @@ export default defineConfig({
     },
   },
   server: {
-    proxy: proxyConfig,
+    proxy: createProxyConfig(OMNIGENT_URL, useAuth),
   },
   build: {
     // default baseline is Safari 16.4+; iPadOS 15 can't parse dep regex lookbehinds (#1978)
@@ -265,8 +301,8 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        manualChunks: shikiManualChunk,
+        manualChunks: (id: string) => streamdownManualChunk(id) ?? shikiManualChunk(id),
       },
     },
   },
-});
+}));

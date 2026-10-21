@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
 LEDGER_NAME = "install_ledger.json"
@@ -536,7 +536,10 @@ def new_ledger(*, source: str, strategy: str, deep: bool) -> InstallLedger:
     entries = LedgerEntries(
         profiles=profiles,
         injected_external_config=observed_external_configs(deep=deep),
-        deps={name: _dep(name, deep=deep) for name in ("uv", "node", "npm", "tmux", "bwrap")},
+        deps={
+            name: _dep(name, deep=deep)
+            for name in ("uv", "node", "npm", "tmux", "bwrap", "databricks")
+        },
         wheel=_wheel_entry(
             deep=deep, source="observed" if source == "backfill" else "recorded", confidence="high"
         ),

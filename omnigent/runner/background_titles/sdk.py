@@ -29,6 +29,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                 "HARNESS_CODEX_ENABLE_WEB_SEARCH": "0",
                 "HARNESS_CODEX_MINIMAL_CONFIG": "1",
                 "HARNESS_CODEX_SKILLS_FILTER": json.dumps("none"),
+                "HARNESS_CODEX_SKILLS_DIR": "",
             }
         )
         spawn_env.pop("HARNESS_CODEX_AGENT_NAME", None)
@@ -49,6 +50,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         "reasoning": {"effort": "low"},
         "max_output_tokens": background_title_max_output_tokens(context.additional_instructions),
     }
+    if context.title_model is not None:
+        event_body["model_override"] = context.title_model
     try:
         client = await context.process_manager.get_client(
             process_key,
