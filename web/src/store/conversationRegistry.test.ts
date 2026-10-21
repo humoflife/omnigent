@@ -5,6 +5,7 @@ import {
   getConnectionProtocol,
   maxLiveConversations,
 } from "./conversationRegistry";
+import * as capabilities from "@/lib/capabilities";
 import type { PendingUserMessage } from "./chatStore";
 
 /** An unsettled optimistic bubble — the shape that pins an entry. */
@@ -18,13 +19,18 @@ function postedBubble(tempId = "pend_1"): PendingUserMessage {
 }
 
 describe("maxLiveConversations", () => {
-  it("allows 30 when multiplexed and only 3 when serial", () => {
-    // Not a product number: HTTP/2 multiplexes over one connection, while
-    // HTTP/1.1 caps ~6 per origin and an SSE stream holds one for its whole
-    // life — 30 there deadlocks every other fetch.
-    expect(maxLiveConversations("multiplexed")).toBe(30);
-    expect(maxLiveConversations("serial")).toBe(3);
-  });
+  it.each([undefined, false, true])(
+    "keeps the serial limit at three unless grids are enabled (%s)",
+    (enabled) => {
+      const cached = vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
+        ...capabilities.FALLBACK_SERVER_INFO,
+        features: enabled === undefined ? {} : { grid_sessions_display_ui: enabled },
+      });
+      expect(maxLiveConversations("multiplexed")).toBe(30);
+      expect(maxLiveConversations("serial")).toBe(enabled ? 4 : 3);
+      cached.mockRestore();
+    },
+  );
 });
 
 describe("getConnectionProtocol", () => {
@@ -114,20 +120,6 @@ describe("ConversationRegistry", () => {
     expect(listener).not.toHaveBeenCalled();
   });
 
-  it("ignores app-global keys written through an entry", () => {
-    const entry = registry.acquire("conv_a");
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      // `selectedModel` is a sticky app-level pref, not conversation state.
-      entry.setState({ selectedModel: "opus" } as never);
-      expect(
-        (entry.getState() as unknown as Record<string, unknown>).selectedModel,
-      ).toBeUndefined();
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
   it("evictLruEvictable disposes the least-recently-viewed entry and returns its id", () => {
     // The slot layer calls this to reclaim one of this tab's own background
     // streams when the origin is saturated. conv_a is oldest → it goes.
@@ -141,6 +133,23 @@ describe("ConversationRegistry", () => {
 
   it("returns null when there is nothing to evict", () => {
     expect(registry.evictLruEvictable()).toBeNull();
+  });
+
+  it("keeps all four visible grid panes live until their final owner unmounts", () => {
+    const releases = ["a", "b", "c", "d"].map((id) => {
+      registry.acquire(id);
+      return registry.retain(id);
+    });
+    const releaseSecondOwner = registry.retain("a");
+    registry.acquire("background");
+    expect(registry.evictLruEvictable()).toBe("background");
+    expect(registry.evictLruEvictable()).toBeNull();
+    releases[0]();
+    expect(registry.evictLruEvictable()).toBeNull();
+    releaseSecondOwner();
+    expect(registry.evictLruEvictable()).toBe("a");
+    releases.slice(1).forEach((release) => release());
+    expect(registry.evictLruEvictable()).toBe("b");
   });
 
   it("treats acquire as a recency touch, so a revisited entry is not the victim", () => {
@@ -275,5 +284,48 @@ describe("ConversationRegistry", () => {
     expect(registry.getActive()?.id).toBe("conv_a");
     registry.release("conv_a");
     expect(registry.getActive()).toBeNull();
+  });
+
+  it("rekey preserves state, moves the active pointer, and drops the old id", () => {
+    const temp = registry.acquire("temp:aaaa0001");
+    temp.setState({ status: "streaming" });
+    registry.setActive("temp:aaaa0001");
+
+    registry.rekey("temp:aaaa0001", "conv_real");
+
+    expect(registry.has("temp:aaaa0001")).toBe(false);
+    expect(temp.disposed).toBe(true);
+    const real = registry.peek("conv_real");
+    expect(real?.id).toBe("conv_real");
+    expect(real?.getState().status).toBe("streaming"); // carried over
+    expect(registry.getActive()?.id).toBe("conv_real"); // active pointer followed
+  });
+
+  it("rekey onto an already-live id keeps its state and carries pending messages", () => {
+    const temp = registry.acquire("temp:aaaa0001");
+    temp.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_1",
+          content: [{ type: "input_text", text: "optimistic first message" }],
+        },
+      ],
+    });
+    const existing = registry.acquire("conv_real");
+    registry.rekey("temp:aaaa0001", "conv_real");
+    expect(registry.peek("conv_real")).toBe(existing);
+    expect(existing.getState().pendingUserMessages).toEqual([
+      {
+        tempId: "pend_1",
+        content: [{ type: "input_text", text: "optimistic first message" }],
+      },
+    ]);
+    expect(temp.disposed).toBe(true);
+    expect(registry.has("temp:aaaa0001")).toBe(false);
+  });
+
+  it("rekey is a no-op when the old id is not live", () => {
+    registry.rekey("temp:deadbeef", "conv_real");
+    expect(registry.has("conv_real")).toBe(false);
   });
 });

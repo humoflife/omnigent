@@ -32,9 +32,12 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
+import { useContext } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
+  ClockIcon,
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
@@ -43,6 +46,8 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -52,10 +57,28 @@ import {
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { RememberScope } from "@/lib/types";
+import { Link, useLocation } from "@/lib/routing";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
+import {
+  ConversationScopeContext,
+  useScopedConversationId,
+} from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
+import { ElicitationMessage } from "./ElicitationMessage";
+import {
+  type ElicitationAnswers,
+  ElicitationSchemaForm,
+  schemaFields,
+} from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+
+const AUTO_RESOLVED_DETAIL =
+  "This request was answered outside this view, for example in the " +
+  "agent's own terminal, another tab, or the approve page.";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -69,6 +92,10 @@ import { ExitPlanModeReview } from "./ExitPlanModeReview";
 function extractOptionLabels(schema: Record<string, unknown>): string[] {
   const properties = schema.properties;
   if (!properties || typeof properties !== "object") return [];
+  // Only when ``answer`` is the whole question. A schema pairing it with, say,
+  // a required ``reason`` renders as buttons that submit the answer and drop
+  // the reason the server said it needed; that shape belongs to the form.
+  if (Object.keys(properties as Record<string, unknown>).length !== 1) return [];
   const answer = (properties as Record<string, unknown>).answer;
   if (!answer || typeof answer !== "object") return [];
   const enumValues = (answer as Record<string, unknown>).enum;
@@ -83,11 +110,45 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
  */
 export type SubmitApprovalFn = (
   elicitationId: string,
-  action: "accept" | "decline",
+  action: "accept" | "decline" | "cancel",
   content?: Record<string, unknown>,
+  meta?: Record<string, unknown>,
 ) => void;
 
+/** Sub-agent session behind a prompt mirrored into an ancestor's view. */
+export interface SubagentRequester {
+  /** Sub-agent session that owns the prompt, e.g. ``"conv_child123"``. */
+  sessionId: string;
+  /** Session whose view shows the mirrored card, e.g. ``"conv_root"``. */
+  ancestorSessionId: string;
+}
+
+/**
+ * Names and links the sub-agent behind a mirrored prompt, so the card is not
+ * read as a request from the session being viewed.
+ */
+function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequester) {
+  const child = useDescendantSession(ancestorSessionId, sessionId);
+  const search = sessionNavigationSearch(useLocation().search);
+  const label = (child && childPrimaryLabel(child)) || null;
+  const link = (
+    <Link
+      to={{ pathname: `/c/${sessionId}`, search }}
+      componentId="approval.open_subagent"
+      className="font-medium text-foreground"
+    >
+      {label ?? "sub-agent"}
+    </Link>
+  );
+  return (
+    <span data-testid="approval-card-requester" className="text-sm">
+      {label ? <>Requested by sub-agent {link}</> : <>Requested by a {link}</>}
+    </span>
+  );
+}
+
 interface ApprovalCardProps {
+  nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
   message: string;
   phase: string;
@@ -103,7 +164,10 @@ interface ApprovalCardProps {
   status: "pending" | "responded";
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } | null;
   /**
    * Structured AskUserQuestion payload — set when the server-side
@@ -132,7 +196,7 @@ interface ApprovalCardProps {
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the binary
-   * approve/reject card grows a third "Accept & allow all edits"
+   * approve/reject card also offers an "Accept & allow all edits"
    * button. Accepting through it asks the server to switch the
    * session into Claude Code's ``acceptEdits`` mode (the web
    * equivalent of the native shift+tab toggle). Absent/false for
@@ -141,8 +205,15 @@ interface ApprovalCardProps {
    */
   allowAllEdits?: boolean;
   /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button — accept plus a session-scoped
+   * ``setMode(auto)``, so Claude reviews this session's later permissions
+   * automatically. Absent/false where the switch was never offered.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: when set, the binary
-   * approve/reject card grows a third "Approve & don't ask again for
+   * approve/reject card also offers an "Approve & don't ask again for
    * <host|tool>" button. Accepting through it asks the server to
    * install a session-scoped allow rule for the tool (scoped to
    * ``host`` for WebFetch, tool-wide otherwise) — the web equivalent
@@ -151,6 +222,10 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP persistence scopes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
+  /** Antigravity prompt details (see {@link AgyPermission}); null outside agy permission requests. */
+  agyPermission?: AgyPermission | null;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -158,9 +233,16 @@ interface ApprovalCardProps {
    * sessions other than the chat store's active one.
    */
   onSubmit?: SubmitApprovalFn;
+  /** Set when the prompt was mirrored up from a sub-agent session. */
+  requester?: SubagentRequester | null;
+  /** Extra classes for the card container, e.g. to drop its border when embedded. */
+  className?: string;
 }
 
+const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
+
 export function ApprovalCard({
+  nativeDelivery,
   elicitationId,
   message,
   phase,
@@ -174,19 +256,48 @@ export function ApprovalCard({
   exitPlanMode,
   codexCommand,
   allowAllEdits,
+  allowAutoMode,
   rememberScope,
+  codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
+  agyPermission,
   onSubmit,
+  requester,
+  className,
 }: ApprovalCardProps) {
-  const submit: SubmitApprovalFn =
+  // In a side-chat pane this resolves to the child id, so the verdict targets
+  // the child's elicitation rather than the main conversation's. null (the main
+  // transcript) leaves submitApproval on its active-conversation default.
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const submitVerdict: SubmitApprovalFn =
     onSubmit ??
-    ((id, action, content) => {
-      void useChatStore.getState().submitApproval(id, action, content);
+    ((id, action, content, meta) => {
+      const store = useChatStore.getState();
+      // Keep the exact call shape for the main chat (no scope); pass the child
+      // id only when scoped so a side-chat verdict targets the child.
+      if (scopedConversationId) {
+        void store.submitApproval(id, action, content, meta, scopedConversationId);
+      } else if (meta === undefined) {
+        void store.submitApproval(id, action, content);
+      } else {
+        void store.submitApproval(id, action, content, meta);
+      }
     });
+  const submit: SubmitApprovalFn = (...args) => {
+    if (!nativeDelivery) return submitVerdict(...args);
+    const [id, action, content, meta] = args;
+    submitVerdict(id, action, content, {
+      ...meta,
+      native_delivery_attempt: nativeDelivery.attempt,
+    });
+  };
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
   const submitOption = (label: string) => {
     submit(elicitationId, "accept", { answer: label });
+  };
+  const submitSchemaAnswers = (content: ElicitationAnswers) => {
+    submit(elicitationId, "accept", content);
   };
   const submitAnswers = (answers: AskUserQuestionAnswers) => {
     // ``content`` is MCP's ``ElicitResult.content``: a flat
@@ -198,6 +309,9 @@ export function ApprovalCard({
   };
   const submitExecPolicyAmendment = (amendment: string[]) => {
     submit(elicitationId, "accept", { execpolicy_amendment: amendment });
+  };
+  const submitAutoMode = () => {
+    submit(elicitationId, "accept", { allow_auto_mode: true });
   };
   const submitAllowAllEdits = () => {
     // Accept AND ask the server to switch the session's permission
@@ -216,6 +330,10 @@ export function ApprovalCard({
     // signals intent, never the rule — then echoes an ``addRules``
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
+  };
+  // Codex MCP and agy persist accepts share the `_meta.persist` verdict shape.
+  const submitPersist = (mode: CodexPersistMode) => {
+    submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {
     // The typed feedback rides on `content.feedback`; the server
@@ -239,6 +357,12 @@ export function ApprovalCard({
   const optionLabels = askPayload === null ? extractOptionLabels(requestedSchema) : [];
   const isAskUserQuestion = askPayload !== null;
   const isMultiChoice = optionLabels.length > 0;
+  // Any other schema that names fields: a free-form string, several
+  // properties, an enum under a name other than ``answer``. These used to
+  // fall through to Approve / Reject, which cannot answer them.
+  const schemaFormFields =
+    askPayload === null && !isMultiChoice ? schemaFields(requestedSchema) : [];
+  const isSchemaForm = schemaFormFields.length > 0;
   const isCodexCommandApproval = codexCommand !== null && codexCommand !== undefined;
   // External URL: the elicitation points to a third-party page (OAuth,
   // external MCP server, etc.) — show a link. Our own /approve/...
@@ -271,7 +395,7 @@ export function ApprovalCard({
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -282,7 +406,10 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const acceptedAutoMode =
+    response?.action === "accept" && response.content?.allow_auto_mode === true;
   const acceptedRemember = response?.content?.remember === true;
+  const acceptedPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -301,6 +428,79 @@ export function ApprovalCard({
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {agyPermission?.alwaysAllowPattern && (
+        <>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full whitespace-normal text-left"
+            onClick={() => submitPersist("session")}
+            title={`Ask Antigravity to allow commands starting with “${agyPermission.alwaysAllowPattern}” for this conversation`}
+            data-testid="approval-card-agy-session-allow"
+            componentId="approval.approve_session_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Allow commands starting with{" "}
+              <code className="break-all rounded bg-muted px-1 font-mono">
+                {agyPermission.alwaysAllowPattern}
+              </code>{" "}
+              for this session
+            </span>
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full whitespace-normal text-left"
+            onClick={() => submitPersist("always")}
+            title={`Ask Antigravity to save a rule allowing commands starting with “${agyPermission.alwaysAllowPattern}” for this Omnigent session`}
+            data-testid="approval-card-agy-always-allow"
+            componentId="approval.approve_always_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Always allow commands starting with{" "}
+              <code className="break-all rounded bg-muted px-1 font-mono">
+                {agyPermission.alwaysAllowPattern}
+              </code>
+            </span>
+          </Button>
+        </>
+      )}
+      {codexPersistModes.includes("session") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitPersist("session")}
+          componentId="approval.approve_session"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve for this session
+        </Button>
+      )}
+      {codexPersistModes.includes("always") && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => submitPersist("always")}
+          componentId="approval.approve_always"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Always allow
+        </Button>
+      )}
+      {allowAutoMode && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitAutoMode}
+          title="Approve this request and let Claude review future tool permissions automatically for this session"
+          componentId="approval.approve_auto_mode"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve &amp; switch to auto mode
+        </Button>
+      )}
       {allowAllEdits && (
         <Button
           size="sm"
@@ -364,8 +564,51 @@ export function ApprovalCard({
     </div>
   );
 
+  const requesterLine = requester ? <SubagentRequesterLine {...requester} /> : null;
+
+  if (status === "pending" && nativeDelivery && nativeDelivery.state !== "ready") {
+    const unconfirmed = nativeDelivery.state === "unconfirmed";
+    return (
+      <Alert
+        data-testid="approval-card"
+        data-state={nativeDelivery.state}
+        className={cn("flex flex-col gap-2", className)}
+      >
+        <AlertTitle className="flex items-center gap-2 text-ui">
+          <ClockIcon className="size-4 text-muted-foreground" />
+          {unconfirmed ? "Approval delivery unconfirmed" : "Waiting for Kiro to confirm"}
+        </AlertTitle>
+        <AlertDescription className="flex flex-col gap-2 text-sm">
+          {requesterLine}
+          <span>
+            {unconfirmed
+              ? "Kiro hasn't confirmed your decision. The previous attempt may still be pending."
+              : "This request stays pending until Kiro confirms your decision."}
+          </span>
+          {formattedPreview && (
+            <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
+              {formattedPreview}
+            </pre>
+          )}
+          {unconfirmed && nativeDelivery.action && (
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                onClick={() => submit(elicitationId, nativeDelivery.action!, undefined)}
+                componentId="approval.retry_delivery"
+              >
+                Retry sending {nativeDelivery.action === "accept" ? "approval" : "rejection"}
+              </Button>
+            </div>
+          )}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
+    const promptExpired = autoResolved && response.reason === "unanswered";
     const accepted = response.action === "accept";
 
     // Distinguish three responded sub-states:
@@ -397,15 +640,30 @@ export function ApprovalCard({
 
     let icon = <XIcon className="size-4 text-destructive" />;
     let label = isExitPlanMode ? "Plan rejected" : "Rejected";
-    if (autoResolved) {
-      // Card was cleared by the chat store when the gated tool's
-      // function_call_output arrived without a UI verdict —
-      // typically because the user approved (or denied) via Claude
-      // Code's TUI prompt directly. We can't know the actual
-      // verdict, so render a neutral pill rather than implying an
-      // accept/reject decision the UI never witnessed.
+    if (promptExpired) {
+      // The server cleared the prompt because the hook stopped waiting
+      // before anyone answered (a severed poll never re-parked, the ask
+      // timed out). Nothing was decided, so say so and tell the user how
+      // to get the agent moving again instead of implying an answer.
+      icon = <ClockIcon className="size-4 text-muted-foreground" />;
+      label = "Prompt expired";
+    } else if (autoResolved) {
+      // Verdict unknown here; explain the neutral pill.
+      icon = (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex" aria-label={AUTO_RESOLVED_DETAIL}>
+              <InfoIcon className="size-4 text-muted-foreground" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
+        </Tooltip>
+      );
+      label = nativeDelivery ? "Resolved in Kiro" : "Resolved elsewhere";
+    } else if (response.action === "cancel") {
+      // Dismissed without deciding — neither approved nor rejected.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
-      label = "Resolved elsewhere";
+      label = "Cancelled";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Submitted";
@@ -415,6 +673,9 @@ export function ApprovalCard({
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
+    } else if (acceptedAutoMode) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · auto mode";
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
@@ -423,6 +684,18 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
+    } else if (
+      phase === "agy_permission" &&
+      (acceptedPersist === "session" || acceptedPersist === "always")
+    ) {
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = acceptedPersist === "session" ? "Session allow requested" : "Always allow requested";
+    } else if (acceptedPersist === "session") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved for this session";
+    } else if (acceptedPersist === "always") {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Always allowed";
     } else if (accepted) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
@@ -436,16 +709,18 @@ export function ApprovalCard({
     // for the same reason: purposeful content instead of the raw ask.
     const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
     const hasBody =
+      requesterLine !== null ||
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
-      planRejectionFeedback !== null;
+      planRejectionFeedback !== null ||
+      promptExpired;
 
     return (
       <Alert
         data-testid="approval-card"
         data-state="responded"
-        className="flex flex-col gap-1 border-muted"
+        className={cn("flex flex-col gap-1 border-muted", className)}
       >
         <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
@@ -454,6 +729,7 @@ export function ApprovalCard({
         </AlertTitle>
         {hasBody && (
           <AlertDescription className="flex flex-col gap-1 text-sm">
+            {requesterLine}
             {isCodexCommandApproval ? (
               <>
                 {codexCommand.reason && <span>{codexCommand.reason}</span>}
@@ -470,7 +746,17 @@ export function ApprovalCard({
                 )}
               </>
             ) : showGatingMessage ? (
-              <span>{message}</span>
+              <>
+                <ElicitationMessage message={message} />
+                {agyPermission?.actionDescription && (
+                  <span
+                    className="text-sm text-muted-foreground"
+                    data-testid="agy-action-description"
+                  >
+                    {agyPermission.actionDescription}
+                  </span>
+                )}
+              </>
             ) : null}
             {submittedAnswers !== null && (
               <ul className="flex flex-col gap-0.5">
@@ -489,6 +775,11 @@ export function ApprovalCard({
                 “{planRejectionFeedback}”
               </span>
             )}
+            {promptExpired && (
+              <span className="text-muted-foreground" data-testid="prompt-expired-hint">
+                Nobody answered before the agent stopped waiting. Send a message to continue.
+              </span>
+            )}
           </AlertDescription>
         )}
       </Alert>
@@ -500,7 +791,7 @@ export function ApprovalCard({
     <Alert
       data-testid="approval-card"
       data-state="pending"
-      className="flex flex-col gap-2 py-3 px-4"
+      className={cn("flex flex-col gap-2 py-3 px-4", className)}
     >
       <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (
@@ -527,6 +818,7 @@ export function ApprovalCard({
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
+        {requesterLine}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>
@@ -560,7 +852,18 @@ export function ApprovalCard({
           </>
         ) : (
           <>
-            <span>{message}</span>
+            <ElicitationMessage message={message} />
+            {agyPermission?.actionDescription && (
+              <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
+                {agyPermission.actionDescription}
+              </span>
+            )}
+            {agyPermission?.alwaysAllowPattern && (
+              <span className="text-sm text-muted-foreground">
+                Always allow saves a rule for this Omnigent session. New sessions have separate
+                rules.
+              </span>
+            )}
             {formattedPreview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
@@ -575,6 +878,12 @@ export function ApprovalCard({
                   </a>
                 </Button>
               </div>
+            ) : isSchemaForm ? (
+              <ElicitationSchemaForm
+                fields={schemaFormFields}
+                onSubmit={submitSchemaAnswers}
+                onReject={() => submitBinary("decline")}
+              />
             ) : isMultiChoice ? (
               <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
                 {optionLabels.map((optLabel) => (
@@ -612,9 +921,17 @@ export function ElicitationCard({
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
 }) {
+  // A sub-agent's prompt is mirrored into its ancestors' streams with
+  // ``targetSessionId`` naming the sub-agent that asked.
+  const conversationId = useScopedConversationId();
+  const requester =
+    item.targetSessionId && conversationId && item.targetSessionId !== conversationId
+      ? { sessionId: item.targetSessionId, ancestorSessionId: conversationId }
+      : null;
   return (
     <ApprovalCard
       elicitationId={item.elicitationId}
+      nativeDelivery={item.nativeDelivery}
       message={item.message}
       phase={item.phase}
       policyName={item.policyName}
@@ -627,8 +944,12 @@ export function ElicitationCard({
       exitPlanMode={item.exitPlanMode}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
+      allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
+      codexPersistModes={item.codexPersistModes}
+      agyPermission={item.agyPermission}
       onSubmit={onSubmit}
+      requester={requester}
     />
   );
 }

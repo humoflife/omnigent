@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -8,7 +8,9 @@ import {
   type WorkspaceFile,
   PathUnreachableError,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceChangedFiles,
+  useWorkspaceDirectories,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
@@ -31,8 +33,12 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   // panel makes, so stubbing it would test a fiction.
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
+  useWorkspaceAsleep: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
+  // The tree fetches expanded lazy dirs centrally via the plural hook; default
+  // it to no expanded dirs (empty map). Tests that drive lazy content override.
+  useWorkspaceDirectories: vi.fn(() => new Map()),
   useWorkspaceEnvironment: vi.fn(),
   useWorkspaceFileSearch: vi.fn(),
   // Real exports consumed by `instanceof` checks (FlatFileList's offline
@@ -49,10 +55,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // real path helpers stay, since other code under test imports them.
 vi.mock("./WorkspacePicker", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
-    <button type="button" data-testid="stub-picker-navigate" onClick={() => onNavigate?.("/etc")}>
-      pick /etc
-    </button>
+  WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
+    <>
+      <button type="button" data-testid="stub-picker-navigate">
+        browse /etc
+      </button>
+      <button type="button" data-testid="stub-picker-confirm" onClick={() => onSelect?.("/etc")}>
+        confirm /etc
+      </button>
+    </>
   ),
 }));
 
@@ -62,10 +73,15 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
+const useAsleepMock = vi.mocked(useWorkspaceAsleep);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
+const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useSearchMock = vi.mocked(useWorkspaceFileSearch);
+const allFilesRefetchMock = vi.fn(() => Promise.resolve());
+const changedFilesRefetchMock = vi.fn(() => Promise.resolve());
+const searchRefetchMock = vi.fn(() => Promise.resolve());
 
 function file(path: string, bytes = 10): WorkspaceFile {
   return {
@@ -74,6 +90,16 @@ function file(path: string, bytes = 10): WorkspaceFile {
     name: path.split("/").at(-1) ?? path,
     path,
     type: "file",
+  };
+}
+
+function dir(path: string): WorkspaceFile {
+  return {
+    bytes: null,
+    modified_at: null,
+    name: path.split("/").at(-1) ?? path,
+    path,
+    type: "directory",
   };
 }
 
@@ -100,6 +126,7 @@ function allFilesResult(files: WorkspaceFile[]) {
     error: null,
     isError: false,
     isLoading: false,
+    refetch: allFilesRefetchMock,
   } as unknown as ReturnType<typeof useWorkspaceAllFiles>;
 }
 
@@ -109,7 +136,12 @@ function changedFilesResult(files: WorkspaceChangedFile[] = []) {
     error: null,
     isError: false,
     isLoading: false,
+    refetch: changedFilesRefetchMock,
   } as unknown as ReturnType<typeof useWorkspaceChangedFiles>;
+}
+
+function unloadedResult() {
+  return { data: undefined, error: null, isError: false, isLoading: false } as unknown;
 }
 
 function directoryResult(files: WorkspaceFile[] = []) {
@@ -136,13 +168,20 @@ function environmentResult(
   } as unknown as ReturnType<typeof useWorkspaceEnvironment>;
 }
 
-function searchResult(files: WorkspaceFile[] | undefined = undefined, isFetching = false) {
+function searchResult(
+  files: WorkspaceFile[] | undefined = undefined,
+  isFetching = false,
+  isPlaceholderData = false,
+  truncated = false,
+) {
   return {
-    data: files,
+    data: files === undefined ? undefined : { files, truncated },
     isFetching,
+    isPlaceholderData,
     isLoading: false,
     isError: false,
     error: null,
+    refetch: searchRefetchMock,
   } as unknown as ReturnType<typeof useWorkspaceFileSearch>;
 }
 
@@ -156,8 +195,11 @@ function renderPanel({
   workingDir = null,
   treeSearchResults = [],
   isSearching = false,
+  isSearchPlaceholder = false,
+  isSearchTruncated = false,
   reachable = null,
   onFileSelect = vi.fn(),
+  listsLoaded = true,
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -168,17 +210,31 @@ function renderPanel({
   workingDir?: string | null;
   treeSearchResults?: WorkspaceFile[] | undefined;
   isSearching?: boolean;
+  isSearchPlaceholder?: boolean;
+  isSearchTruncated?: boolean;
   reachable?: {
     unconfined: boolean;
     roots: { path: string; access: string; origin: string }[];
   } | null;
   onFileSelect?: (path: string) => void;
+  /** False: both list queries are disabled and hold no data (nothing could serve them). */
+  listsLoaded?: boolean;
 }) {
-  useAllFilesMock.mockReturnValue(allFilesResult(files));
-  useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
+  useAllFilesMock.mockReturnValue(
+    listsLoaded
+      ? allFilesResult(files)
+      : (unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>),
+  );
+  useChangedFilesMock.mockReturnValue(
+    listsLoaded
+      ? changedFilesResult(changedFiles)
+      : (unloadedResult() as ReturnType<typeof useWorkspaceChangedFiles>),
+  );
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
-  useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching));
+  useSearchMock.mockReturnValue(
+    searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
+  );
 
   return render(
     <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
@@ -204,25 +260,34 @@ function renderPanel({
 
 beforeEach(() => {
   useAllFilesMock.mockReset();
+  useAsleepMock.mockReturnValue(false);
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
+  useDirectoriesMock.mockClear();
   useEnvironmentMock.mockReset();
   useSearchMock.mockReset();
+  allFilesRefetchMock.mockClear();
+  changedFilesRefetchMock.mockClear();
+  searchRefetchMock.mockClear();
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 describe("FilesPanel working folder directory", () => {
-  it("shows the directory basename below the Working folder label", () => {
+  it("shows the directory basename with the former heading typography", () => {
     renderPanel({
       conversationId: "conv_wdir_posix",
       files: [],
       workingDir: "/home/user/my-project",
     });
-    expect(screen.getByText("my-project")).toBeInTheDocument();
+    const path = screen.getByText("my-project");
+    expect(path).toHaveClass("font-medium", "text-ui");
+    expect(path).not.toHaveClass("font-mono");
+    expect(screen.queryByRole("button", { name: "Back to working folder" })).toBeNull();
   });
 
   it("does not use the native title tooltip because the custom tooltip shows the full path", () => {
@@ -246,27 +311,45 @@ describe("FilesPanel working folder directory", () => {
 
   it("does not render a directory label when workingDir is null", () => {
     renderPanel({ conversationId: "conv_wdir_null", files: [] });
-    // "Working folder" label is present but no directory name span
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByText("Working folder")).toBeNull();
     // There should be no element with a title that looks like a path
     expect(screen.queryByTitle("/")).toBeNull();
   });
 });
 
-describe("FilesPanel working folder header role", () => {
-  // The "Working folder" header is a static label in every mode — it is not a
-  // collapse toggle. Collapsing was removed: the panel's content is the whole
-  // point of the panel, so there is nothing to collapse to. The content is
-  // always visible and the header never carries aria-expanded.
-  it("renders the header as a static label (no toggle button) in the standalone card", () => {
+describe("FilesPanel header role", () => {
+  it("omits the redundant Working folder heading in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByText("Working folder")).toBeNull();
     // Content is always shown — the tree search box is part of it.
-    expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
+    const search = screen.getByRole("searchbox", { name: "Search all files" });
+    expect(search).toBeInTheDocument();
+    expect(search).toHaveAttribute("placeholder", "Find files by name");
+    expect(screen.queryByRole("group", { name: "Search mode" })).not.toBeInTheDocument();
+    expect(search.parentElement).toHaveClass("rounded-lg");
+    expect(search.parentElement).not.toHaveClass("rounded-full");
   });
 
-  it("renders the header as a static label (no toggle button) in frameless (inline rail) mode", () => {
+  it("labels the changed-files scope with a Changes heading", () => {
+    renderPanel({
+      conversationId: "conv_header_changes",
+      files: [],
+      flatView: true,
+      workingDir: "/home/user/proj",
+    });
+    const changesHeading = screen.getByRole("heading", { name: "Changes" });
+    expect(changesHeading).toBeInTheDocument();
+    expect(changesHeading).toHaveClass("pl-1");
+    expect(changesHeading.parentElement).toHaveClass("h-11");
+    expect(screen.queryByRole("heading", { name: "Working folder" })).toBeNull();
+    expect(screen.queryByTestId("browse-location-path")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Go to parent folder" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy folder path: proj" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refresh files" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
+  });
+
+  it("uses the breadcrumb as the frameless inline-rail header", () => {
     useAllFilesMock.mockReturnValue(allFilesResult([]));
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
     useDirectoryMock.mockReturnValue(directoryResult());
@@ -294,34 +377,54 @@ describe("FilesPanel working folder header role", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByText("Working folder")).toBeNull();
+    expect(screen.getByText("workspace")).toHaveClass("font-medium", "text-ui");
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
-  it("renders a static label header with a Close button in the drawer", () => {
+  it("keeps the Close button in the drawer without a redundant heading", () => {
     renderPanel({ conversationId: "conv_header_drawer", files: [], onClose: vi.fn() });
-    // The drawer adds an X close button; the title is a plain label everywhere.
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByText("Working folder")).toBeNull();
     expect(screen.getByRole("button", { name: "Close files" })).toBeInTheDocument();
   });
 });
 
 describe("FilesPanel hidden-files toggle icon", () => {
-  // The eye reflects the current state, not the pending action: a plain eye
-  // means hidden files are visible, a slashed eye means they are filtered out.
-  it("shows a plain eye while hidden files are visible", () => {
+  // The icon previews the action the toggle will perform.
+  it("shows a slashed eye when clicking will hide hidden files", () => {
     renderPanel({ conversationId: "conv_eye_on", files: [], showHidden: true });
     const toggle = screen.getByRole("button", { name: "Hide hidden files" });
+    expect(toggle).toHaveAttribute("data-size", "icon-sm");
+    expect(toggle.querySelector(".lucide-eye-off")).not.toBeNull();
+  });
+
+  it("shows a plain eye when clicking will reveal hidden files", () => {
+    renderPanel({ conversationId: "conv_eye_off", files: [], showHidden: false });
+    const toggle = screen.getByRole("button", { name: "Show hidden files" });
     expect(toggle.querySelector(".lucide-eye")).not.toBeNull();
     expect(toggle.querySelector(".lucide-eye-off")).toBeNull();
   });
+});
 
-  it("shows a slashed eye while hidden files are filtered out", () => {
-    renderPanel({ conversationId: "conv_eye_off", files: [], showHidden: false });
-    const toggle = screen.getByRole("button", { name: "Show hidden files" });
-    expect(toggle.querySelector(".lucide-eye-off")).not.toBeNull();
+describe("FilesPanel on an asleep sandbox", () => {
+  it.each([true, false])(
+    "says the sandbox is offline instead of an empty workspace (flatView=%s)",
+    (flatView) => {
+      useAsleepMock.mockReturnValue(true);
+      renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
+
+      expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
+      expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
+      expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps showing a list cached before the sandbox went offline", () => {
+    useAsleepMock.mockReturnValue(true);
+    renderPanel({ conversationId: "conv_asleep", files: [file("README.md")] });
+
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
   });
 });
 
@@ -532,6 +635,7 @@ describe("FilesPanel changed files search", () => {
   });
 
   it("preserves inline folder expansion state when opening the drawer", () => {
+    vi.useFakeTimers();
     const files = [file("docs/Guide.md"), file("src/App.tsx")];
     useAllFilesMock.mockReturnValue(allFilesResult(files));
     useChangedFilesMock.mockReturnValue(changedFilesResult());
@@ -584,16 +688,23 @@ describe("FilesPanel changed files search", () => {
 
     render(<Harness />);
 
+    const drawer = screen.getByTestId("files-panel-drawer");
+    expect(drawer).toHaveClass("shadow-none");
+    expect(drawer).not.toHaveClass("shadow-lg");
+
     const srcFolder = screen.getByRole("button", { name: /src\//i });
     expect(srcFolder).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("App.tsx")).toBeInTheDocument();
 
     fireEvent.click(srcFolder);
     expect(srcFolder).toHaveAttribute("aria-expanded", "false");
+    act(() => vi.advanceTimersByTime(180));
     expect(screen.queryByText("App.tsx")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "open drawer" }));
 
+    expect(drawer).toHaveClass("shadow-lg");
+    expect(drawer).not.toHaveClass("shadow-none");
     const drawerSrcFolder = screen.getByRole("button", { name: /src\//i });
     expect(drawerSrcFolder).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("App.tsx")).toBeNull();
@@ -778,6 +889,92 @@ describe("FilesPanel tree (Explore) search", () => {
     expect(screen.getByText((t) => t.includes("src/main.py"))).toBeInTheDocument();
   });
 
+  it("tells the user when the server stopped searching early instead of a flat no-match", () => {
+    // The hook now carries the server's truncated flag; the panel must hand it
+    // to the tree so an empty result on a huge repo is not shown as definitive.
+    vi.useFakeTimers();
+
+    renderPanel({
+      conversationId: "conv_tree_search_truncated",
+      files: [file("src/App.tsx")],
+      treeSearchResults: [],
+      isSearchTruncated: true,
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+      target: { value: "reyden" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(screen.getByText(/No files match "reyden"/)).toHaveTextContent(
+      "the search stopped early, so results may be incomplete",
+    );
+  });
+
+  it("does not render stale results from a previous query while the new one loads", () => {
+    // React Query keeps the prior term's results (placeholderData) in `data`
+    // while the new term is fetching. Those must NOT render as if they matched
+    // the new query — a slow runner would otherwise show a previous search's
+    // answers. FilesPanel drops placeholder data, so the tree shows "Searching…".
+    vi.useFakeTimers();
+
+    renderPanel({
+      conversationId: "conv_tree_search_stale",
+      files: [file("src/App.tsx")],
+      // These are the PREVIOUS query's results, still in `data` as placeholder.
+      treeSearchResults: [file("stale/prev.md")],
+      isSearching: true,
+      isSearchPlaceholder: true,
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+      target: { value: "fresh" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    // The stale result must not appear; the loading state shows instead.
+    expect(screen.queryByText((t) => t.includes("stale/prev.md"))).toBeNull();
+    expect(screen.getByText("Searching…")).toBeInTheDocument();
+  });
+
+  it("drops back to the tree synchronously when a folder result is revealed", () => {
+    // Revealing a folder from search must clear the DEBOUNCED query too, not
+    // just the raw input — FolderTree renders search mode off the debounced
+    // value, so clearing only the raw query would leave the flat results up for
+    // the 300ms window and the reveal scroll would target unmounted rows. We
+    // assert the results list is gone WITHOUT advancing timers.
+    vi.useFakeTimers();
+
+    renderPanel({
+      conversationId: "conv_tree_reveal_exits_search",
+      files: [file("src/App.tsx"), dir("src")],
+      treeSearchResults: [dir("src")],
+    });
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search all files" }), {
+      target: { value: "src" },
+    });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+
+    // Search mode is active: the folder shows as a result row (trailing slash).
+    const folderResult = screen.getByRole("button", { name: /src\// });
+    fireEvent.click(folderResult);
+
+    // No timer advance here. If exitTreeSearch only cleared the raw query, the
+    // debounced value would still be "src" and search mode would persist. The
+    // hook must now be called with an empty query (tree mode) right away.
+    expect(
+      useSearchMock.mock.calls.at(-1)?.[1],
+      "revealing a folder must clear the debounced query immediately",
+    ).toBe("");
+  });
+
   it("returns to the tree view when the search query is cleared", () => {
     vi.useFakeTimers();
 
@@ -871,9 +1068,9 @@ describe("FilesPanel tree (Explore) search", () => {
     expect(folderRow.style.paddingLeft).toBe(fileRow.style.paddingLeft);
     expect(folderRow.style.paddingLeft).toBe("8px");
 
-    // Minimal layout: folders show ONLY a chevron (no folder icon) before the
-    // name. The folder row should contain exactly one svg (the chevron).
-    expect(folderButton.querySelectorAll("svg")).toHaveLength(1);
+    // The folder state and hover chevron share one icon slot, so neither
+    // changes the name's indentation.
+    expect(folderButton.querySelectorAll("svg")).toHaveLength(2);
 
     // A nested file (App.tsx, depth 1) is indented one INDENT_STEP further and
     // draws a vertical indent-guide line marking its ancestor level.
@@ -1060,7 +1257,10 @@ describe("FilesPanel tree (Explore) search", () => {
     // Hidden by default — the toggle starts collapsed.
     expect(screen.queryByRole("textbox", { name: "files to include" })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Show search filters" }));
+    const preferences = screen.getByRole("button", { name: "Show search filters" });
+    expect(preferences).toHaveAttribute("data-size", "icon-sm");
+    expect(preferences).not.toHaveAttribute("title");
+    fireEvent.click(preferences);
 
     // Both glob inputs become visible after the toggle is opened.
     expect(screen.getByRole("textbox", { name: "files to include" })).toBeInTheDocument();
@@ -1203,7 +1403,21 @@ describe("FilesPanel sort control", () => {
       files: [file("a.txt")],
       flatView: false,
     });
-    expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
+    const sort = screen.getByRole("button", { name: /^Sort:/ });
+    expect(sort).toBeInTheDocument();
+    expect(sort).toHaveAttribute("data-size", "sm");
+    expect(sort).toHaveClass("gap-[2px]");
+    expect(sort).not.toHaveAttribute("title");
+    expect(sort).toHaveTextContent("Last edited");
+    expect(sort).not.toHaveTextContent("Sort:");
+    expect(sort.querySelector(".lucide-arrow-down-up")).not.toBeNull();
+    expect(sort.querySelector(".lucide-file-clock")).toBeNull();
+    const filter = screen.getByRole("button", { name: "Show search filters" });
+    expect(sort.compareDocumentPosition(filter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const visibility = screen.getByRole("button", { name: "Show hidden files" });
+    expect(
+      filter.compareDocumentPosition(visibility) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });
 
@@ -1336,12 +1550,14 @@ describe("FolderTree expanded state across conversation switches", () => {
   }
 
   it("re-syncs expanded folders when switching conversations without remounting", () => {
+    vi.useFakeTimers();
     const files = [file("src/App.tsx"), file("README.md")];
     const { view, tree } = renderTree("conv_tree_resync_a", files);
 
     // Collapse src/ in conversation A (expanded by default).
     expect(screen.getByText("App.tsx")).toBeDefined();
     fireEvent.click(screen.getByRole("button", { name: /src\// }));
+    act(() => vi.advanceTimersByTime(180));
     expect(screen.queryByText("App.tsx")).toBeNull();
 
     // Switch to conversation B in place: defaults apply, src/ is expanded.
@@ -1377,6 +1593,7 @@ describe("FilesPanel browse location", () => {
 
     expect(screen.queryByTestId("browse-location-path")).toBeNull();
     expect(screen.getByText("proj")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Go to parent folder" })).toBeDisabled();
   });
 
   it("shows the full path, clickable, when the session is unconfined", () => {
@@ -1391,6 +1608,27 @@ describe("FilesPanel browse location", () => {
     // tell you where you are before you decide to go elsewhere.
     const trigger = screen.getByTestId("browse-location-path");
     expect(trigger).toHaveTextContent("/home/user/proj");
+    expect(trigger).toHaveClass("cursor-pointer", "hover:bg-muted");
+    expect(trigger).not.toHaveClass("hover:bg-accent");
+  });
+
+  it("navigates up one level with an icon-sm back button", () => {
+    renderPanel({
+      conversationId: "conv_parent_folder",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+
+    const back = screen.getByRole("button", { name: "Go to parent folder" });
+    expect(back).toHaveAttribute("data-size", "icon-sm");
+    fireEvent.click(back);
+
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_parent_folder",
+      expect.anything(),
+      "/home/user",
+    );
   });
 
   it("opens a file at an absolute browse location by its absolute path", () => {
@@ -1413,6 +1651,7 @@ describe("FilesPanel browse location", () => {
     );
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     fireEvent.click(screen.getByText("hosts"));
 
@@ -1431,6 +1670,8 @@ describe("FilesPanel browse location", () => {
 
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).not.toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
     expect(useSearchMock).toHaveBeenLastCalledWith(
@@ -1441,6 +1682,14 @@ describe("FilesPanel browse location", () => {
       expect.anything(),
       "/etc",
     );
+
+    const reset = screen.getByRole("button", { name: "Back to working folder" });
+    expect(reset.compareDocumentPosition(screen.getByTestId("browse-location-path"))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    fireEvent.click(reset);
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "");
+    expect(screen.queryByRole("button", { name: "Back to working folder" })).toBeNull();
   });
 
   it("restores the browsed location across unmount/remount (file-viewer round trip)", () => {
@@ -1455,6 +1704,7 @@ describe("FilesPanel browse location", () => {
     });
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     expect(useAllFilesMock).toHaveBeenLastCalledWith(
       "conv_viewer_roundtrip",
       expect.anything(),
@@ -1487,6 +1737,7 @@ describe("FilesPanel browse location", () => {
     });
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     first.unmount();
 
     renderPanel({
@@ -1631,6 +1882,30 @@ describe("FilesPanel header copy path", () => {
     expect(copyTextMock).toHaveBeenCalledWith("/home/user/proj");
   });
 
+  it("refreshes the current tree after the copy control", async () => {
+    renderPanel({
+      conversationId: "conv_refresh_files",
+      files: [dir("src")],
+      workingDir: "/home/user/proj",
+    });
+
+    const copy = screen.getByRole("button", { name: "Copy folder path: proj" });
+    const refresh = screen.getByRole("button", { name: "Refresh files" });
+    expect(refresh).toHaveAttribute("data-size", "icon-sm");
+    expect(copy.compareDocumentPosition(refresh) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(refresh);
+
+    await waitFor(() => expect(allFilesRefetchMock).toHaveBeenCalledTimes(1));
+    expect(changedFilesRefetchMock).toHaveBeenCalledTimes(1);
+    expect(useDirectoriesMock).toHaveBeenLastCalledWith(
+      "conv_refresh_files",
+      expect.any(Array),
+      "",
+      1,
+    );
+  });
+
   it("copies the browsed directory after navigating away from the workspace", () => {
     // The header tracks wherever the panel is pointed, so the copy must
     // follow it rather than pinning to the session's workspace.
@@ -1643,6 +1918,7 @@ describe("FilesPanel header copy path", () => {
 
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     fireEvent.click(screen.getByRole("button", { name: "Copy folder path: etc" }));
 
@@ -1651,7 +1927,7 @@ describe("FilesPanel header copy path", () => {
 });
 
 describe("FilesPanel double-click navigation", () => {
-  it("re-roots onto a double-clicked folder and asks the server RELATIVELY", () => {
+  it("re-roots from a double-clicked folder and asks the server relatively", () => {
     // The wire form is the point. A subfolder of the workspace must be
     // requested relative, because the server authorizes an absolute location
     // at OWNER level -- sending "/home/user/proj/src" would 403 every

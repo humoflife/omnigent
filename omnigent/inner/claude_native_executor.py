@@ -3,25 +3,37 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
+from functools import partial
 from pathlib import Path
 
-from omnigent.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
+    ClaudeSignInPending,
+    ClaudeTerminalDialog,
+    ClaudeTerminalExited,
+    ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
+    cancellable_injection,
+    has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
+    is_auth_slash_command,
     kill_session,
     read_active_session_id,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
+    read_model_picker_values,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -34,9 +46,20 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    attachment_reference_line,
+    framework_notices,
+)
+from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
+
+# How long a turn waits for the person to answer a Claude question or permission
+# prompt that held its message before anything was typed. Inside the server's
+# 600 s pending-input lifetime, so a message still held at the end is reported.
+_ANSWER_HOLD_S = 8 * 60.0
+_ANSWER_POLL_S = 1.0
 
 
 class ClaudeNativeExecutor(Executor):
@@ -99,16 +122,90 @@ class ClaudeNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
+        if is_auth_slash_command(text):
+            # Same dead end as in run_turn(): /login and /logout must
+            # never be typed into the pane. Refusing the live injection
+            # keeps the runner's buffered copy (no injection.consumed is
+            # emitted), so the message re-arrives as the next turn and
+            # run_turn's short-circuit answers it with the `omni setup`
+            # guidance instead of spending a model turn on it.
+            return False
         try:
             async with self._inject_lock:
-                await asyncio.to_thread(
-                    inject_user_message,
-                    self._bridge_dir,
-                    content=text,
-                )
+                await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
         return True
+
+    async def _inject_turn(
+        self,
+        text: str,
+        notices: list[str],
+        wanted_model: str | None,
+        wanted_model_arg: str | None,
+    ) -> None:
+        """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
+        async with self._inject_lock:
+            context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+            context_path.unlink(missing_ok=True)
+            if wanted_model_arg is not None:
+                # Accepted trade-off: ``/model <id>`` also saves the
+                # pick as the person's global default for new Claude
+                # sessions. Runs to completion before the message
+                # inject below (same lock), so its confirm Enter can't
+                # race the message.
+                await self._inject(
+                    partial(
+                        inject_slash_command,
+                        self._bridge_dir,
+                        command=f"/model {wanted_model_arg}",
+                        auto_confirm=True,
+                        confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                    )
+                )
+                # Track the routed id, not the alias: the next turn's
+                # comparison is against what routing asked for.
+                self._applied_model = wanted_model
+            await self._inject_prompt(text, notices)
+
+    async def _wait_for_answer(self, deadline: float) -> bool:
+        """
+        Hold a turn whose message a pending question or permission prompt refused.
+
+        The web UI and the embedded terminal both offer the prompt, so once the
+        person answers it the message can be delivered instead of failed.
+
+        :param deadline: Event-loop time the hold ends at, shared by every
+            refusal in the turn.
+        :returns: ``True`` once nothing waits for an answer, ``False`` when the
+            hold ran out.
+        """
+        loop = asyncio.get_running_loop()
+        _logger.info(
+            "claude-native: holding the message until the pending Claude prompt is answered",
+            extra={"session_id": self._request_session_id},
+        )
+        while loop.time() < deadline:
+            await asyncio.sleep(_ANSWER_POLL_S)
+            try:
+                pending = await asyncio.to_thread(has_pending_user_prompt, self._bridge_dir)
+            except (OSError, RuntimeError):
+                continue
+            if not pending:
+                return True
+        return False
+
+    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+        """Inject user text with one-shot context while holding the injection lock."""
+        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context_path.unlink(missing_ok=True)
+        if notices:
+            context_path.write_text("\n\n".join(notices), encoding="utf-8")
+        try:
+            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+        except BaseException:
+            context_path.unlink(missing_ok=True)
+            raise
 
     async def run_turn(
         self,
@@ -130,7 +227,7 @@ class ClaudeNativeExecutor(Executor):
             claude-native delivers raw author instructions once, at terminal
             launch, via ``--append-system-prompt`` (see
             ``omnigent.runner.native.orchestration`` and
-            ``omnigent.claude_native``) — not per-turn through this
+            ``omnigent.harnesses.claude_native.main``) — not per-turn through this
             parameter.
         :param config: Per-turn executor config. Only ``config.model``
             is used: when intelligent routing picks a model for this turn,
@@ -138,7 +235,10 @@ class ClaudeNativeExecutor(Executor):
             ``config.model``) and the switch is applied inline, before the
             message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
-            or :class:`ExecutorError` on bridge failure.
+            or :class:`ExecutorError` on bridge failure. A question or
+            permission prompt that refuses the message before anything is
+            typed holds the turn until it is answered (see
+            :meth:`_wait_for_answer`), then the message is delivered.
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -150,8 +250,27 @@ class ClaudeNativeExecutor(Executor):
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
+        notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
+            return
+        if is_auth_slash_command(text):
+            # Claude Code's sign-in flow is an interactive TUI handoff the
+            # bridge cannot drive, so /login is escaped into plain text and
+            # reaches the model as a prompt. An expired login answers it with
+            # "Login expired · Please run /login" — a loop. Point at the host
+            # command that does re-authenticate instead of typing anything.
+            # `omni setup` covers both directions: its harness menu signs in
+            # (`claude auth login --claudeai`) and signs out (`claude auth
+            # logout`), so one pointer serves /login and /logout alike.
+            yield ExecutorError(
+                message=(
+                    "Claude Code's sign-in runs in its own terminal, so /login and "
+                    "/logout do nothing from the web chat. Run omni setup on the host "
+                    "to sign in again — or to sign out — then retry."
+                ),
+                undelivered=True,
+            )
             return
         from omnigent.runtime import telemetry
 
@@ -171,33 +290,43 @@ class ClaudeNativeExecutor(Executor):
         # box and verifies its submit) delivers the message — in order,
         # once.
         wanted_model = config.model if config is not None else None
-        # ``/model`` only accepts this session's aliases / custom slot; a
-        # bare catalog id is ignored and the pane keeps its old model.
+        # ``/model`` only accepts this session's picker values, aliases, and
+        # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
         try:
             with telemetry.span("claude_native.inject"):
-                async with self._inject_lock:
-                    if wanted_model_arg is not None:
-                        # Accepted trade-off: ``/model <id>`` also saves the
-                        # pick as the person's global default for new Claude
-                        # sessions. Runs to completion before the message
-                        # inject below (same lock), so its confirm Enter can't
-                        # race the message.
-                        await asyncio.to_thread(
-                            inject_slash_command,
-                            self._bridge_dir,
-                            command=f"/model {wanted_model_arg}",
-                            auto_confirm=True,
-                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                        )
-                        # Track the routed id, not the alias: the next turn's
-                        # comparison is against what routing asked for.
-                        self._applied_model = wanted_model
-                    await asyncio.to_thread(
-                        inject_user_message,
-                        self._bridge_dir,
-                        content=text,
-                    )
+                answer_deadline: float | None = None
+                while True:
+                    try:
+                        await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                        break
+                    except ClaudeUserPromptPending as exc:
+                        # Refused before anything was typed: wait for the answer and retry.
+                        if not exc.nothing_typed:
+                            raise
+                        if answer_deadline is None:
+                            answer_deadline = asyncio.get_running_loop().time() + _ANSWER_HOLD_S
+                        if not await self._wait_for_answer(answer_deadline):
+                            raise
+                        wanted_model_arg = self._model_command_arg(wanted_model)
+        except ClaudeTerminalExited as exc:
+            # Claude Code exits 0 on /quit or a closed window. The turn still
+            # fails, but the person's own teardown is not a defect; a pane that
+            # died on its own keeps the ERROR.
+            clean_exit = exc.exit_status == "0"
+            log = _logger.warning if clean_exit else _logger.error
+            log(
+                "claude-native: terminal exited before prompt delivery (status %s)",
+                exc.exit_status or "unknown",
+                exc_info=not clean_exit,
+                extra={"session_id": self._request_session_id},
+            )
+            cleanup_error = self._reap_failed_turn()
+            message = describe_exception(exc)
+            if cleanup_error is not None:
+                message = f"{message} Cleanup also failed: {cleanup_error}"
+            yield ExecutorError(message=message, undelivered=True)
+            return
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
@@ -207,7 +336,52 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message)
+            yield ExecutorError(message=message, undelivered=True)
+            return
+        except ClaudeSignInPending as exc:
+            # The pane is parked on a launcher sign-in the person finishes from
+            # the card's link; reaping it would destroy that prompt.
+            _logger.warning(
+                "claude-native: launcher sign-in pending; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=str(exc),
+                code=exc.code,
+                title=exc.title,
+                remediation=exc.remediation,
+                undelivered=True,
+            )
+            return
+        except ClaudeTerminalDialog as exc:
+            # The pane is parked on a surface the person clears from the
+            # embedded terminal; reaping it would destroy that. Both raisers
+            # (the readiness gate, and the slash-command refusal ahead of a
+            # routed /model) fail before the first keystroke, so the sender's
+            # queued copy is the only record of the message.
+            _logger.warning(
+                "claude-native: terminal surface blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeUserPromptPending as exc:
+            # A question or permission prompt held the message before its submit
+            # Enter, past the hold or after typing began; the pane stays for the
+            # person to answer it.
+            _logger.warning(
+                "claude-native: pending Claude prompt blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
+            # The terminal may still launch, or its unsent draft may be recoverable.
+            _logger.warning(
+                "claude-native: terminal refused delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
         except RuntimeError as exc:
             _logger.exception(
@@ -217,6 +391,23 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    async def _inject(self, operation: Callable[[], None]) -> None:
+        """Drain cancelled delivery workers before releasing the pane's injection lock."""
+        cancelled = threading.Event()
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            self._reap_failed_turn()
+            raise
 
     def _reap_failed_turn(self) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
@@ -243,9 +434,10 @@ class ClaudeNativeExecutor(Executor):
         Two gates: the switch must be needed at all
         (:meth:`_should_switch_model`), and the routed catalog id must
         translate into vocabulary ``/model`` accepts — the session's
-        family aliases, or the exact id of its custom picker slot. The
-        pinning comes from the terminal's launch env, recorded in the
-        bridge config because this process doesn't share that env.
+        picker values, its family aliases, or the exact id of its custom
+        picker slot. Both the pinning and the picker come from the launch,
+        recorded in the bridge config because this process doesn't share
+        the terminal's env.
 
         An untranslatable id fails open: the message still goes in, on
         the current model, with a warning. Typing a value the CLI won't
@@ -269,19 +461,24 @@ class ClaudeNativeExecutor(Executor):
             )
             return None
         env = read_model_env(self._bridge_dir) or None
-        wanted_arg = claude_model_command_arg(wanted_model, env)
+        # The launch recorded this pane's picker, which is the only
+        # vocabulary that spells a managed model of no Claude family.
+        picker_values = read_model_picker_values(self._bridge_dir)
+        wanted_arg = claude_model_command_arg(wanted_model, env, picker_values=picker_values)
         if wanted_arg is None:
             _logger.warning(
                 "claude-native: skipping /model — routed model %r has no spelling this "
-                "session accepts (pins=%s); sending the turn on the current model",
+                "session accepts (pins=%s, picker=%s); sending the turn on the current model",
                 wanted_model,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": self._request_session_id},
             )
             return None
         if (
             self._applied_model is not None
-            and claude_model_command_arg(self._applied_model, env) == wanted_arg
+            and claude_model_command_arg(self._applied_model, env, picker_values=picker_values)
+            == wanted_arg
         ):
             # Resolves to the model the pane is already on, so the switch
             # would be a pointless prompt (and can pop a confirm dialog).
@@ -381,12 +578,11 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     Return the latest user text from executor messages.
 
     Multimodal content blocks (images, files) are materialized to the
-    bridge directory and referenced by path in the returned text so
+    session attachment cache and referenced by path in the returned text so
     Claude Code can read them via its Read tool.
 
     :param messages: Conversation history in executor message shape.
-    :param bridge_dir: Bridge directory path for writing attachment
-        files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Concatenated latest user message text, or ``""`` when
         no user text is present.
     """
@@ -402,15 +598,14 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
 
     Text blocks are extracted directly. Multimodal blocks
     (``input_image``, ``input_file``) that carry resolved base64 data
-    URIs are decoded to files in the bridge directory and referenced
+    URIs are decoded to files in the session attachment cache and referenced
     by path so Claude Code can view them with its Read tool.
 
     :param content: Message content, e.g. a string or a list of
         ``{"type": "input_text", "text": "..."}`` blocks. May also
         contain ``input_image`` blocks with an ``image_url`` data URI
         or ``input_file`` blocks with a ``file_data`` data URI.
-    :param bridge_dir: Bridge directory path for writing attachment
-        files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Plain text content with file-path references prepended
         for any materialized attachments.
     """
@@ -423,6 +618,8 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type", "")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                continue
             if block_type == "input_text":
                 text = block.get("text")
                 if isinstance(text, str):
@@ -432,3 +629,11 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
+
+
+def _latest_framework_notices(messages: list[Message]) -> list[str]:
+    """Return framework context attached to the latest user turn."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return framework_notices(message.get("content"))
+    return []

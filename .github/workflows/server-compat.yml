@@ -44,6 +44,7 @@ on:
       - "tests/e2e/**"
       - "tests/e2e_ui/**"
       - "tests/_helpers/compat.py"
+      - "tests/helpers/**"
       - ".github/actions/compat-smoke-run/**"
       - ".github/actions/compat-smoke-ui-run/**"
       - ".github/workflows/server-compat.yml"
@@ -71,7 +72,7 @@ jobs:
       latest_tag: ${{ steps.tag.outputs.latest_tag }}
     steps:
       - name: Checkout (tags only)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           sparse-checkout: .github/scripts/ci
@@ -97,9 +98,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run compat smoke (Config 1)
         uses: ./.github/actions/compat-smoke-run
@@ -114,9 +114,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run compat smoke (Config 2)
         uses: ./.github/actions/compat-smoke-run
@@ -131,9 +130,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run UI compat smoke (Config A)
         uses: ./.github/actions/compat-smoke-ui-run
@@ -148,9 +146,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run UI compat smoke (Config B)
         uses: ./.github/actions/compat-smoke-ui-run
@@ -175,7 +172,7 @@ jobs:
       integration_matrix: ${{ steps.matrix.outputs.integration_matrix }}
     steps:
       - name: Check out CI scripts + tags
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           sparse-checkout: .github/scripts/ci
           # Full history so `git tag` sees every release tag for the matrix.
@@ -204,7 +201,7 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.e2e_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # fetch-depth 0 so the action can `git worktree add` the old tags.
           ref: ${{ github.ref }}
@@ -239,7 +236,7 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.integration_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
@@ -267,7 +264,7 @@ jobs:
       ui_matrix: ${{ steps.matrix.outputs.ui_matrix }}
     steps:
       - name: Check out CI scripts + tags
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           sparse-checkout: .github/scripts/ci
           fetch-depth: 0
@@ -290,7 +287,7 @@ jobs:
       matrix: ${{ fromJSON(needs.setup-ui.outputs.ui_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0

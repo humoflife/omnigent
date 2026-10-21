@@ -32,6 +32,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -347,6 +348,9 @@ class QwenExecutor(Executor):
             env=env,
             cwd=self._cwd,
             limit=_STREAM_LIMIT,
+            # Own session/group: the sandbox launcher forks the real agent,
+            # and without a group boundary teardown reaches only the wrapper.
+            **_proc.spawn_kwargs(),
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -391,11 +395,11 @@ class QwenExecutor(Executor):
             if not sandbox.active:
                 return self._qwen_path
             # qwen is an npm CLI: it must read its own install + node_modules
-            # and write its config dir (~/.qwen) and /tmp, or it can't start
+            # and write its config dir (~/.qwen), or it can't start
             # inside the jail.
             qwen_dir = Path(self._qwen_path).resolve().parent.parent
             sandbox = with_additional_read_roots(sandbox, [qwen_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen", Path("/tmp")])
+            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -1580,10 +1584,12 @@ class QwenExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
             try:
-                self._proc.terminate()
+                # Tree-aware: the handle is the sandbox launcher, not the
+                # agent it forked. A bare terminate() orphans the agent.
+                _proc.terminate_tree(self._proc)
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
-                    self._proc.kill()
+                    _proc.kill_tree(self._proc)
             finally:
                 self._proc = None

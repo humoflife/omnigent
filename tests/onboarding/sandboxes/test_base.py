@@ -13,19 +13,23 @@ import os
 import re
 import shlex
 import subprocess
+import traceback
 from pathlib import Path
 from typing import ClassVar
 
+import click
 import pytest
 import yaml
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
+    SandboxGoneError,
     SandboxLauncher,
     render_host_config_write_command,
     supervise_host_command,
 )
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 _HOST_LAUNCH = "FOO=bar omnigent host --server https://srv"
 
@@ -210,6 +214,38 @@ def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
     assert out == "tok-123:host_abc:managed-abc"
 
 
+@pytest.mark.parametrize("error_type", [click.ClickException, SandboxGoneError])
+def test_start_host_launch_failure_redacts_the_token(
+    error_type: type[click.ClickException],
+) -> None:
+    """
+    Providers echo a failed command in their error, the server shows that error
+    to the user as the session failure, and the host launch command carries the
+    launch token. The type must survive: a wake recreates on SandboxGoneError.
+    """
+
+    class _FailingLaunchLauncher(_RecordingLauncher):
+        def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
+            if "omnigent host --server" in command:
+                raise error_type(
+                    f"Remote command failed on sandbox '{sandbox_id}' (exit 1): {command}"
+                ) from RuntimeError(command)
+            return super().run(sandbox_id, command, check=check)
+
+    with pytest.raises(error_type) as caught:
+        _FailingLaunchLauncher().start_host(
+            "sb-1",
+            token="tok-secret-123",
+            host_id="host_abc",
+            host_name="managed-abc",
+            server_url="https://srv",
+        )
+
+    assert "OMNIGENT_HOST_TOKEN=[redacted]" in caught.value.message
+    rendered = "".join(traceback.format_exception(caught.value)) + repr(caught.value)
+    assert "tok-secret-123" not in rendered
+
+
 def test_start_host_default_materialize_clones_repo() -> None:
     """
     With a ``repo_url``, the default :meth:`materialize_workspace` clones into
@@ -225,15 +261,44 @@ def test_start_host_default_materialize_clones_repo() -> None:
         host_id="host_abc",
         host_name="managed-abc",
         server_url="https://srv",
-        repo_url="https://github.com/org/repo",
-        repo_branch="release-1.2",
-        repo_name="repo",
+        repos=[
+            RepoWorkspace(
+                url="https://github.com/org/repo", branch="release-1.2", repo_name="repo"
+            )
+        ],
     )
 
     assert workspace == "/root/workspace/repo"
     assert (
         "git clone --branch release-1.2 --single-branch -- "
         "https://github.com/org/repo /root/workspace/repo"
+    ) in launcher.commands
+
+
+def test_start_host_clones_multiple_repos_into_sibling_dirs() -> None:
+    """
+    Several repos → the exec-model default clones each into
+    ``<workspace>/<repo_name>`` and returns the parent workspace (the working
+    directory that holds them all), matching the entrypoint (k8s) rule.
+    """
+    launcher = _RecordingLauncher()
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/api", branch=None, repo_name="api"),
+            RepoWorkspace(url="https://github.com/org/web", branch="dev", repo_name="web"),
+        ],
+    )
+
+    assert workspace == "/root/workspace"
+    assert "git clone -- https://github.com/org/api /root/workspace/api" in launcher.commands
+    assert (
+        "git clone --branch dev --single-branch -- https://github.com/org/web /root/workspace/web"
     ) in launcher.commands
 
 
@@ -272,9 +337,7 @@ def test_materialize_workspace_override_resolves_local_checkout_without_cloning(
         host_id="host_abc",
         host_name="managed-abc",
         server_url="https://srv",
-        repo_url="https://github.com/org/repo",
-        repo_branch="main",
-        repo_name="repo",
+        repos=[RepoWorkspace(url="https://github.com/org/repo", branch="main", repo_name="repo")],
     )
 
     assert workspace == "/checkouts/repo"

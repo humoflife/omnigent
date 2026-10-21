@@ -1,6 +1,8 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -11,10 +13,14 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
+from itertools import batched, groupby
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import httpx
 from fastapi import FastAPI, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -22,13 +28,40 @@ from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
-from starlette.routing import Mount, Route
+from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
-from omnigent.debug_logging import set_current_user_id
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    audit_event_logger,
+    current_request_audit_attrs,
+    debug_event,
+    debug_sink_enabled,
+    reset_request_audit_attrs,
+    runner_log_scope,
+    set_current_request_id,
+    set_current_runner_id,
+    set_current_session_id,
+    set_current_user_id,
+)
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    is_cancelled_rpc_error,
+    is_permission_denied_rpc_error,
+)
+from omnigent.extensions import ExtensionPluginState
+from omnigent.extensions.assets import (
+    ResolvedBundle,
+    build_asset_index,
+    parse_dev_bundle_overrides,
+)
+from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
@@ -44,14 +77,21 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server.auth import (
+    AuthProvider,
+    SharingMode,
+    auth_mode,
+    authentication_requires_identity,
+)
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -66,6 +106,8 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.extension_assets import create_extension_assets_router
+from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -84,7 +126,12 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import (
+    TRANSIENT_REJECTION_STATUSES,
+    RunnerSessionInitializer,
+    is_session_agent_removed,
+    runner_response_error_body,
+)
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -94,7 +141,11 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
-from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    SessionConnectivity,
+    runner_seen_is_fresh,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -102,6 +153,7 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+_RECONNECT_BINDING_BATCH_SIZE = 128
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -129,10 +181,17 @@ class ServerInfoResponse(BaseModel):
     needs_setup: bool
     databricks_features: bool
     managed_sandboxes_enabled: bool
+    durable_initial_input: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
+    # UI-relevant capability flags per launchable provider, e.g.
+    # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
+    # (multi-repo picker vs single). Providers absent from the map default off.
+    sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
+    public_sharing_max_level: Literal["read", "edit"] = "read"
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -140,7 +199,54 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # The archive PATCH accepts ``delete_worktree``; older servers reject it.
+    archive_worktree_cleanup: bool = True
+    # A managed create or fork accepts ``host_id`` naming its new sandbox host;
+    # older servers reject it.
+    request_managed_sandbox_host_id: bool = True
+    # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
+    # older servers, which clients treat as unsupported.
+    agent_install: bool = False
+    # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
+    agent_detail: bool = False
+    # Owner configuration reads and conditional PATCH updates.
+    agent_config_edit: bool = False
     branding: BrandingInfo
+
+
+def _resolve_extension_state(
+    provided: ExtensionPluginState | None,
+) -> ExtensionPluginState:
+    """Resolve extensions without allowing catalog discovery to stop the server."""
+    if provided is not None:
+        return provided
+    try:
+        return load_extension_plugin_state()
+    # Distribution metadata is an external installation boundary. Preserve the
+    # rest of the server if global discovery itself fails before per-plugin
+    # failure isolation can apply.
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
+        return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
+
+
+def _resolve_extension_assets(
+    state: ExtensionPluginState,
+) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
+    """Resolve bundle snapshots without allowing asset failures to stop the server."""
+    try:
+        overrides = None
+        raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
+        if raw_overrides:
+            overrides = parse_dev_bundle_overrides(raw_overrides)
+            _logger.warning(
+                "using development extension bundle overrides for: %s",
+                ", ".join(sorted(overrides)),
+            )
+        return build_asset_index(state, overrides=overrides)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
+        return {}, {"registry": str(exc)}
 
 
 def _server_version() -> str:
@@ -194,7 +300,202 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+# First-segment namespaces that must keep resolving at the origin root: the JSON
+# API (`api`, `v1`), auth flows (`auth`, `oauth`), health, `.well-known`,
+# FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`), and the
+# SPA's own static-asset mount (`assets`) — a base path of `/assets` would be
+# indistinguishable from an already-destripped `/assets/<file>` request under a
+# prefix-stripping proxy, double-stripping it into a 404. Doubles as the
+# SPA-fallback allowlist and the base-path collision check (see
+# `_normalize_base_path` / `_is_web_ui_api_fallback_path`).
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset(
+    {
+        "api",
+        "assets",
+        "auth",
+        "docs",
+        "health",
+        "oauth",
+        "openapi.json",
+        "redoc",
+        "v1",
+        ".well-known",
+    }
+)
+
+# First segments of the SPA's own top-level routes (web/src/App.tsx). A base
+# path colliding with one of these is ambiguous for the frontend's
+# `withBasePath` (web/src/lib/basePath.ts): it treats a path already starting
+# with the configured base as "already prefixed" to avoid double-prefixing a
+# redirect target that genuinely is one (e.g. an already-absolute return_to
+# read back from `window.location`). With `--base-path /c`, a share link for
+# session `<id>` — the unprefixed app path `/c/<id>` — is misread as already
+# under the `/c` base and left unprefixed, producing a dead link instead of
+# `/c/c/<id>`. Rejected here rather than made "smarter" client-side: the
+# ambiguity is unresolvable in general (a base of `/login` has the same
+# problem for the post-login redirect). NOT folded into
+# `_WEB_UI_API_FALLBACK_PREFIXES`: unlike that set, these ARE legitimate SPA
+# routes that must still fall back to `index.html` when unmatched by a
+# static file, just never as a base-path prefix.
+_WEB_UI_ROUTE_PREFIXES = frozenset(
+    {
+        "approve",
+        "c",
+        "canvas",
+        "extensions",
+        "inbox",
+        "login",
+        "members",
+        "policies",
+        "register",
+        "settings",
+        "tasks",
+        "usage",
+    }
+)
+
+
+# RFC 3986 unreserved + path separator. Percent is deliberately excluded:
+# BasePathMiddleware matches the configured prefix against ASGI's already
+# percent-decoded request path, so an encoded prefix would never match and
+# routing would break silently. Reject it at config time instead.
+_BASE_PATH_ALLOWED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/"
+)
+
+
+def _normalize_base_path(value: str | None) -> str:
+    """Normalize ``OMNIGENT_WEB_BASE_PATH`` to a leading-slash, no-trailing-slash string.
+
+    ``None``, ``""`` and ``"/"`` all map to ``""`` (root deployment, today's
+    behavior). Mirrors the frontend's ``getBasePath`` (``web/src/lib/basePath.ts``)
+    so the two agree on the prefix.
+
+    :param value: Raw base path, e.g. ``"/proxy/6767/"`` or ``"proxy/6767"``.
+    :returns: Normalized path (``"/proxy/6767"``) or ``""``.
+    :raises ValueError: If the path starts with ``//`` (protocol-relative, a
+        cross-origin asset/redirect risk) or contains characters outside
+        ``_BASE_PATH_ALLOWED`` — quotes, angle brackets, spaces, backslashes,
+        percent, etc. The value is spliced into ``index.html`` unescaped, and
+        percent-encoding would also fail the decoded-path match in
+        ``BasePathMiddleware``.
+    """
+    if not value:
+        return ""
+    trimmed = value.strip()
+    if trimmed in ("", "/"):
+        return ""
+    if not trimmed.startswith("/"):
+        trimmed = f"/{trimmed}"
+    if trimmed.startswith("//"):
+        # Protocol-relative (`//evil.example`) spliced into an asset ref would
+        # point at another origin; a slash-only value (`//`, `///`) would rstrip
+        # to empty and hit an IndexError at `segments[1]` below. Reject both here,
+        # before the trailing-slash strip, so misconfiguration fails loud.
+        raise ValueError(f"Invalid base path {value!r}: must not start with '//'.")
+    trimmed = trimmed.rstrip("/")
+    invalid = set(trimmed) - _BASE_PATH_ALLOWED
+    if invalid:
+        raise ValueError(
+            f"Invalid base path {value!r}: only URL path characters "
+            f"(letters, digits, '-._~/') are allowed, got {sorted(invalid)!r}."
+        )
+    segments = trimmed.split("/")
+    if "." in segments or ".." in segments:
+        # A `.`/`..` segment (`/proxy/../app`) is normalized away by the browser,
+        # so the sent path would disagree with the literal prefix the middleware
+        # strips. Reject it.
+        raise ValueError(f"Invalid base path {value!r}: '.'/'..' segments are not allowed.")
+    if segments[1] in _WEB_UI_API_FALLBACK_PREFIXES:
+        # A base path whose first segment is a reserved API namespace (`/v1`,
+        # `/v1/sessions`, `/auth/...`) makes the strip middleware eat canonical
+        # `/{seg}/...` requests, breaking the root-API compatibility guarantee.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a reserved API route namespace; choose a path outside it."
+        )
+    if segments[1] in _WEB_UI_ROUTE_PREFIXES:
+        # A base path whose first segment names one of the SPA's own routes
+        # (`/c`, `/login`, ...) is ambiguous for withBasePath's "already
+        # prefixed?" check on the frontend (web/src/lib/basePath.ts): an
+        # unprefixed app path like `/c/<id>` (a share link) is
+        # indistinguishable from an already-prefixed one under base `/c`, so
+        # it is left unprefixed instead of becoming `/c/c/<id>`.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a top-level app route; choose a path outside it."
+        )
+    return trimmed
+
+
+def _rewrite_web_ui_index(html: str, base_path: str) -> str:
+    """Rebase the built ``index.html`` for the configured deployment base path.
+
+    The standalone build emits relative asset references (``./assets/...``,
+    ``./favicon.svg``) so dynamic code-split chunks resolve via
+    ``import.meta.url`` under any path prefix. Relative references break on a
+    deep-link refresh, so they are rewritten here to absolute
+    ``{base}/assets/...``. With an empty base this yields root-absolute
+    ``/assets/...`` — byte-identical in spirit to a non-prefixed deployment.
+
+    When a base path is configured, a small inline script publishes it as
+    ``window.__OMNIGENT_BASE_PATH__`` ahead of the entry module so the SPA can
+    prefix its own API/WebSocket/navigation URLs (see ``basePath.ts``).
+
+    :param html: Raw built ``index.html`` contents.
+    :param base_path: Normalized base path (``""`` or ``"/proxy/6767"``).
+    :returns: Rewritten HTML.
+    """
+    rewritten = html.replace('="./', f'="{base_path}/')
+    # Drop the ``<base href="/">`` fallback whenever we rewrite. The asset refs
+    # are absolute now, so it is redundant, and keeping it would resolve fragment
+    # refs (inline SVG ``url(#id)``, footnote/heading anchors) against the origin
+    # root instead of the current document. At root this restores the exact
+    # pre-rewrite markup; the source tag stays as a safety net for an older
+    # server that serves index.html without this rewrite (version skew).
+    rewritten = re.sub(r"<base\b[^>]*>", "", rewritten)
+    if base_path:
+        # JSON-encode and neutralize any ``</`` so a hostile base path can't
+        # break out of the inline script element.
+        literal = json.dumps(base_path).replace("</", "<\\/")
+        injection = f"<script>window.__OMNIGENT_BASE_PATH__ = {literal};</script>"
+        rewritten = rewritten.replace("<head>", f"<head>{injection}", 1)
+    return rewritten
+
+
+class BasePathMiddleware:
+    """Strip a configured public base path prefix from incoming request paths.
+
+    Lets one server work whether the reverse proxy forwards the prefix
+    (code-server ``/absproxy/<port>/``, a plain nginx/Traefik subpath) or
+    strips it (code-server ``/proxy/<port>/``): when the prefix is present it
+    is removed so routing matches the canonical ``/v1/...`` paths, and
+    ``root_path`` is set so server-generated URLs stay under the mount. A
+    no-op when no base path is configured, or for a request that does not
+    carry the prefix (the stripping-proxy case).
+
+    :param app: The wrapped ASGI application.
+    :param base_path: Normalized base path (``""`` disables the middleware).
+    """
+
+    def __init__(self, app: ASGIApp, base_path: str) -> None:
+        self.app = app
+        self.base_path = base_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.base_path and scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == self.base_path or path.startswith(f"{self.base_path}/"):
+                scope = dict(scope)
+                scope["path"] = path[len(self.base_path) :] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, (bytes, bytearray)):
+                    prefix = self.base_path.encode()
+                    if raw_path.startswith(prefix):
+                        scope["raw_path"] = raw_path[len(prefix) :] or b"/"
+                scope["root_path"] = self.base_path
+        await self.app(scope, receive, send)
+
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -211,18 +512,57 @@ _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
+# The exact message Starlette's BaseHTTPMiddleware.call_next raises when the
+# downstream app sent nothing and raised no Exception — which only a bare
+# CancelledError escaping a cancelled in-flight handler produces.
+_NO_RESPONSE_RETURNED = "No response returned."
+
+# Nginx's nonstandard "client closed request" status: the request was torn
+# down before a response could be sent.
+_HTTP_CLIENT_CLOSED_REQUEST = 499
+
 
 def _session_id_from_request(request: Request) -> str | None:
     """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
 
-    Threaded into exception-handler logs (``extra={"session_id": …}``) so a 500
-    on a session route carries its conversation id in the debug-logs table. Read
-    from the request explicitly per-invocation — no ambient/request-scoped
-    session ContextVar exists on the server, deliberately, to avoid
-    cross-request mis-attribution.
+    Threaded into exception-handler logs so a 500 on a session route carries its
+    conversation id in the debug-logs table. Parsed from the path here (rather
+    than the matched route param) because a handler may raise before the id is
+    otherwise in scope; the ambient request-scoped session ContextVar bound by
+    the middleware (:func:`omnigent.debug_logging.set_current_session_id`) covers
+    the non-exception records.
     """
     match = _SESSION_PATH_RE.search(request.url.path)
     return match.group(1) if match else None
+
+
+def _error_audit_extra(
+    request: Request,
+    *,
+    phase: str = "error",
+    **attributes: str,
+) -> dict[str, object]:
+    """Build the ``extra=`` for an exception-handler log: operation + session id.
+
+    Routing has already happened by the time an exception handler runs, so the
+    matched route's name (the handler function, e.g. ``get_session``) is the
+    operation. The record keeps its message and stack trace (via ``exc_info``)
+    while gaining a queryable ``event_name`` + ``session_id``, correlating it to
+    the middleware's ``error`` envelope row.
+    """
+    route = request.scope.get("route")
+    operation = getattr(route, "name", None) or "unmatched"
+    attributes.setdefault("method", request.method)
+    attributes.setdefault("route", getattr(route, "path", None) or "<unmatched>")
+    request_id = getattr(request.state, "audit_request_id", None)
+    if isinstance(request_id, str):
+        attributes.setdefault("request_id", request_id)
+    return debug_event(
+        operation,
+        session_id=_session_id_from_request(request),
+        phase=phase,
+        **attributes,
+    )
 
 
 # polly's and debby's multi-file bundles are packaged under
@@ -318,6 +658,57 @@ def request_route_template_for_metrics(request: Request) -> str:
     if isinstance(route, Route | Mount):
         return route.path
     return _UNMATCHED_ROUTE_TEMPLATE
+
+
+def _resolve_audit_route(request: Request) -> tuple[str, str, str | None]:
+    """Resolve ``(operation, route_template, session_id)`` before routing.
+
+    ``request.scope["route"]`` is only populated *after* routing (inside
+    ``call_next``), so to name the pre-call ``start`` audit event and bind the
+    ambient session id we match the request against the app's routes here. The
+    operation is the matched route's name (its handler function name, e.g.
+    ``create_session``); the session id comes from the matched route's
+    ``{session_id}`` path param — never the loose path regex — so a non-session
+    route (or ``/v1/sessions`` list) resolves to a null session id. Returns
+    ``("unmatched", "<unmatched>", None)`` when nothing matches.
+    """
+    for route in request.app.router.routes:
+        try:
+            match, child_scope = route.matches(request.scope)
+        except Exception:  # noqa: BLE001 — route matching must never fail a request
+            continue
+        if match is Match.FULL:
+            name = getattr(route, "name", None) or "unmatched"
+            template = getattr(route, "path", _UNMATCHED_ROUTE_TEMPLATE)
+            session_id = child_scope.get("path_params", {}).get("session_id")
+            return name, template, session_id
+    return "unmatched", _UNMATCHED_ROUTE_TEMPLATE, None
+
+
+def _emit_audit_event(
+    operation: str,
+    phase: str,
+    *,
+    session_id: str | None,
+    **attributes: str,
+) -> None:
+    """Emit one server audit row (table-only, gated on the debug sink).
+
+    A no-op when the debug-log sink is off, so it costs nothing for OSS / users
+    who never enabled it. ``event_name`` is the operation (handler name) and
+    ``phase`` / ``route`` / ``status`` / ``duration_ms`` ride as attributes so a
+    reader groups by operation and filters by phase.
+    """
+    if not debug_sink_enabled():
+        return
+    # Audit logging must never fail a request.
+    with suppress(Exception):
+        audit_event_logger().info(
+            "%s %s",
+            operation,
+            phase,
+            extra=debug_event(operation, session_id=session_id, phase=phase, **attributes),
+        )
 
 
 def _request_status_code_for_metrics(
@@ -463,12 +854,10 @@ def _ensure_builtin_agent(
       bundle), evict the local cache so the next load re-fetches from
       ``bundle_location``, then return.
 
-    The evict on the matching-hash path matters because
-    :meth:`AgentCache.load` is keyed by ``agent_id`` and trusts its
-    in-memory / on-disk entry without checking ``bundle_location``: a
-    replica that boots with a cache lagging the (already-current) DB
-    row — or a prior boot whose ``replace`` failed after ``update``
-    succeeded — would otherwise keep serving the stale spec.
+    The evict on the matching-hash path is a cheap reset of this
+    process's entry; :meth:`AgentCache.load` itself rebuilds any entry
+    built from another ``bundle_location`` (a lagging replica's cache, or
+    a prior boot whose ``replace`` failed after ``update`` succeeded).
 
     This replaces the old seed-once behavior, which skipped on row
     existence and so served a stale spec after the wheel shipped a new
@@ -636,7 +1025,7 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     import inspect
     import tempfile
 
-    from omnigent.native_dispatch import resolve_hook
+    from omnigent.native.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
     materialize = resolve_hook(provider, "materialize_agent_spec")
@@ -673,7 +1062,7 @@ def _ensure_default_native_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     for agent in NATIVE_CODING_AGENTS:
         provider = native_provider_for_key(agent.key)
@@ -744,16 +1133,23 @@ def _ensure_default_acp_agents(
     agent_cache: Any,
 ) -> None:
     """
-    Seed a picker agent for each ACP harness set up on THIS server's host.
+    Seed a picker agent per builtin ACP CLI row and per configured ``acp:`` agent.
 
     Native harnesses seed a fixed ``<harness>-ui`` agent each
-    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
-    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
-    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
-    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
-    host with no ACP setup — the common remote-server case, where the server holds
-    no ``acp:`` config — this seeds nothing. When both sources name the same
-    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
+    (:func:`_ensure_default_native_agents`) unconditionally; the picker hides a row
+    the selected host cannot launch, reading that host's ``configured_harnesses``
+    readiness map. Builtin ACP CLI harnesses follow the same model, because the
+    vendor CLI runs on the *executing* host (the attached runner) rather than on the
+    server: gating the row on the server's own PATH left Devin and Grok missing from
+    the picker on every remote server, even when the runner had them installed.
+
+    User-configured ``acp:<slug>`` agents stay config-gated. Their launch command is
+    resolved from the *host's* own ``acp:`` block at spawn time, so a row naming a
+    slug the executing host does not define could never launch; surfacing those on a
+    remote server first needs the host to advertise its configured slugs.
+
+    When both sources name the same harness, the configured agent wins (see
+    :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
     A malformed ``acp:`` block is logged and skipped, never fatal to startup
@@ -767,7 +1163,6 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
@@ -793,12 +1188,12 @@ def _ensure_default_acp_agents(
             bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
         )
 
-    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
-    # by the catalog id (already a valid slug), not the display label. A row a
-    # configured agent already claims is skipped: both seed the same
-    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
-    for key, row in ACP_CLI_HARNESSES.items():
-        if key in shadowed or resolve_cli_binary(row.binary) is None:
+    # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
+    # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
+    # (already a valid slug), not the display label. A row a configured agent already
+    # claims is skipped: both seed the same ``builtin_agent_id``.
+    for key in ACP_CLI_HARNESSES:
+        if key in shadowed:
             continue
         _ensure_builtin_agent(
             agent_store,
@@ -945,10 +1340,21 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
+    github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
+    databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
+    mcp_registry: Any | None = None,
+    mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    public_sharing_max_level: str | Callable[[], str] | None = None,
+    default_public_sessions: str | Callable[[], str] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    extension_state: ExtensionPluginState | None = None,
+    base_path: str | None = None,
+    host_sharded: bool = False,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1023,6 +1429,15 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
+    :param github_config: Parsed GitHub App configuration
+        (:class:`omnigent.server.github_app.GitHubAppConfig`) enabling
+        the per-user "Connect GitHub" flow. ``None`` disables the
+        integration (the connect UI is hidden and the routes stay
+        unmounted).
+    :param github_store: Persistence for per-user GitHub connections
+        (:class:`omnigent.connections.github.GithubConnectionStore`).
+        Required alongside ``github_config`` to enable the integration;
+        wired together by ``create_app``'s caller.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1042,6 +1457,9 @@ def create_app(
     :param feature_flags: Optional immutable release-feature snapshot.
         When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
         enabled set once at application construction.
+    :param extension_state: Optional pre-resolved installed-extension registry.
+        When omitted, entry points are discovered once at application
+        construction and the process-cached state is reused thereafter.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -1054,15 +1472,45 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param public_sharing_max_level: Maximum effective ``__public__`` permission,
+        ``"read"`` (default) or ``"edit"``. Edit requires authenticated multi-user
+        access, including accounts, OIDC and trusted-header deployments.
+        ``None`` uses ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` with a file-backed
+        admin override. A static value or callable is deployment-managed.
+        The live ceiling also limits stored grants, without upgrading Read.
+    :param default_public_sessions: Which new sessions start with a public
+        read grant: ``"off"`` (all private), ``"sandbox"`` (managed cloud
+        sandbox sessions only) or ``"all"``. Same shape as ``public_sharing``:
+        ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
+        with an admin-editable file override; a static value or callable is
+        authoritative. Never grants past ``sharing_mode``/``public_sharing``.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
+    :param base_path: Public URL prefix the server is served under by a
+        reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
+        ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
+        root deployment.
+    :param host_sharded: Whether replicas sit behind a router that keys host
+        and runner tunnels by host_id. When ``True``, a host-scoped request
+        for a live host whose tunnel is on another replica returns 400
+        ``wrong_replica``; otherwise it returns 409 "host is offline". The
+        400 recovers only for a client that sent the slice-key header and
+        retries without it, which the web client does only for requests it
+        keyed itself.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    # Public base path for serving behind a subpath reverse proxy (issue
+    # #1031). Falls back to OMNIGENT_WEB_BASE_PATH so Docker/PaaS entrypoints
+    # pick it up without threading a kwarg. Empty → root deployment (default).
+    resolved_base_path = _normalize_base_path(
+        base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+    )
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
@@ -1074,6 +1522,8 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    resolved_extension_state = _resolve_extension_state(extension_state)
+    extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1108,10 +1558,14 @@ def create_app(
             )
 
     from omnigent.runner.routing import RunnerRouter
-    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+    from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+    from omnigent.server.routes._host_launch import configure_host_sharding
 
-    tunnel_registry = TunnelRegistry()
+    configure_host_sharding(host_sharded)
+    # A tunnel this replica retires on purpose is a handoff, not a lost runner.
+    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -1123,10 +1577,16 @@ def create_app(
         # is the latter, not a false wrong-replica.
         host_registry=host_registry,
         host_store=host_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        conversation_store=conversation_store,
+        file_store=file_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1214,6 +1674,7 @@ def create_app(
         _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
             conversation_store,
             runner_router,
+            agent_store=agent_store,
         )
 
         from omnigent.runner.resource_registry import (
@@ -1310,6 +1771,12 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                # Managed-sandbox execution target: provision a fresh sandbox per
+                # fire. ``managed_launches`` is created during app construction
+                # (before this lifespan runs), so it is already on state here.
+                sandbox_config=sandbox_config,
+                managed_launches=app_inst.state.managed_launches,
+                app_state=app_inst.state,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1341,9 +1808,26 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        managed_sandbox_reaper: ManagedSandboxReaper | None = None
+        if sandbox_config is not None and sandbox_config.reaper.enabled:
+            if host_store is None:
+                _logger.warning(
+                    "Managed sandbox reaper is enabled but no host store is configured; "
+                    "the reaper will not run"
+                )
+            else:
+                managed_sandbox_reaper = ManagedSandboxReaper(
+                    host_store=host_store,
+                    sandbox_config=sandbox_config,
+                )
+                app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
+                await managed_sandbox_reaper.start()
+
         try:
             yield
         finally:
+            if managed_sandbox_reaper is not None:
+                await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -1353,12 +1837,16 @@ def create_app(
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
             # Stop in-flight background managed-sandbox launches so a
-            # slow provision doesn't outlive the ASGI shutdown (the
-            # sandbox itself, if already provisioned, is reaped by the
-            # provider lifetime cap — see the hook's docstring).
+            # slow provision doesn't outlive the ASGI shutdown, after giving
+            # unbound ones the deployment's drain to bind their host (see the
+            # hook's docstring).
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
-            await cancel_managed_launch_tasks()
+            await cancel_managed_launch_tasks(
+                drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
+            )
+            if startup_inputs is not None:
+                await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1375,6 +1863,14 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
+    from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
+
+    runner_account_store = (
+        account_store
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        else None
+    )
+
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
     from omnigent.runtime import telemetry
 
@@ -1387,11 +1883,89 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    # Only managed creates accept a durable first input, and only managed hosts
+    # need their startup recovered on the replica holding the tunnel.
+    startup_inputs = (
+        ManagedStartupInputs(conversation_store, host_registry)
+        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        else None
+    )
+    app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
+    app.state.mcp_gateway_backend = mcp_gateway_backend
+    app.state.mcp_registry = mcp_registry
+    app.state.mcp_registry_auth = auth_provider
+    app.state.runner_tunnel_tokens = runner_tunnel_tokens
+
+    def _admit_host_launch(
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool,
+        transfer_from_host_id: str | None,
+    ) -> None:
+        """Authorize the launch and validate its host against the saved agent."""
+        if host_store is not None:
+            host_store.admit_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+                require_account_owner=runner_account_store is not None,
+            )
+        from omnigent.host.frames import CAP_MCP_REGISTRY
+        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+        connection = host_registry.get(host_id)
+        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is not None:
+                require_session_registry_mcp_support(
+                    conv,
+                    connection.hello.capabilities,
+                    component="host",
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+
+    host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
+    # a full-page redirect (not covered by BasePathMiddleware's inbound-only
+    # strip) can prefix it themselves. "" for a root deployment.
+    app.state.base_path = resolved_base_path
+    # GitHub App integration: enabled only when both the config and the
+    # connection store are wired. The client is stateless (holds config),
+    # built once and reused for the connect flow.
+    # Per-user connection providers (GitHub, ...). One registry entry per
+    # provider (connections_registry) drives uniform wiring: each gets
+    # ``app.state.<name>_{config,store,client}``, populated only when both its
+    # config and its store are present, else None. The info endpoint's
+    # enabled_connections list and the router mounting below both read these.
+    from omnigent.server.connections_registry import connection_providers
+
+    _connection_inputs = {
+        "github": (github_config, github_store),
+        "databricks": (databricks_config, databricks_store),
+    }
+    for _provider in connection_providers():
+        _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
+        _on = _cfg is not None and _store is not None
+        setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
+        setattr(app.state, f"{_provider.name}_store", _store if _on else None)
+        setattr(
+            app.state,
+            f"{_provider.name}_client",
+            _provider.client_factory(_cfg) if _on else None,
+        )
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1399,7 +1973,7 @@ def create_app(
     # promoted (``promote_if_listed`` runs at login) would be authorized by the
     # routes yet see no admin chrome. The file portion lazily reloads on mtime
     # change (no restart).
-    from omnigent.server.admin_list import load_admin_list
+    from omnigent.server.admin_list import load_admin_list, promote_if_listed
 
     admin_list = load_admin_list(extra=frozenset(admins or ()))
     # Session-sharing policy, normalized to a per-request callable, plus a
@@ -1459,6 +2033,62 @@ def create_app(
         _public_static = bool(public_sharing)
         app.state.public_sharing = lambda: _public_static
         app.state.public_sharing_writable = False
+    from omnigent.server.sharing_settings import (
+        DefaultPublicSessions,
+        PublicSharingMaxLevel,
+        PublicSharingPolicyMiddleware,
+        public_sharing_max_level_env_default,
+        read_public_sharing_max_level_override,
+    )
+
+    app.state.public_edit_available = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    _public_max_env = public_sharing_max_level_env_default()
+
+    def _resolve_public_sharing_max_level() -> PublicSharingMaxLevel:
+        from omnigent.server.auth import local_single_user_enabled
+
+        if not app.state.public_edit_available or local_single_user_enabled():
+            return PublicSharingMaxLevel.READ
+        if public_sharing_max_level is None:
+            override = read_public_sharing_max_level_override()
+            return override if override is not None else _public_max_env
+        value = (
+            public_sharing_max_level()
+            if callable(public_sharing_max_level)
+            else public_sharing_max_level
+        )
+        return PublicSharingMaxLevel.coerce(value)
+
+    app.state.public_sharing_max_level = _resolve_public_sharing_max_level
+    app.state.public_sharing_max_level_writable = public_sharing_max_level is None
+    # Default-public policy for NEW sessions, same shape as public_sharing.
+
+    if default_public_sessions is None:
+        from omnigent.server.sharing_settings import (
+            default_public_sessions_env_default,
+            read_default_public_sessions_override,
+        )
+
+        _default_public_env = default_public_sessions_env_default()
+
+        def _resolve_default_public_sessions() -> DefaultPublicSessions:
+            override = read_default_public_sessions_override()
+            return override if override is not None else _default_public_env
+
+        app.state.default_public_sessions = _resolve_default_public_sessions
+        app.state.default_public_sessions_writable = True
+    elif callable(default_public_sessions):
+        _default_public_callable = default_public_sessions
+        app.state.default_public_sessions = lambda: DefaultPublicSessions.coerce(
+            _default_public_callable()
+        )
+        app.state.default_public_sessions_writable = False
+    else:
+        _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
+        app.state.default_public_sessions = lambda: _default_public_static
+        app.state.default_public_sessions_writable = False
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -1491,6 +2121,9 @@ def create_app(
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
+    # Extend a managed sandbox while its runner tunnel is live (the managed-path
+    # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
+    managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -1512,7 +2145,10 @@ def create_app(
         :returns: The downstream route response.
         """
         request_id = uuid.uuid4().hex
+        request.state.audit_request_id = request_id
         set_request_id_for_access_log(request_id)
+        set_current_request_id(request_id)
+        set_current_runner_id(None)
         set_request_user_agent_for_access_log(
             request.headers.get("user-agent"),
         )
@@ -1533,6 +2169,33 @@ def create_app(
         except Exception:  # noqa: BLE001 — attribution is best-effort
             set_current_user_id(None)
 
+        # Resolve the operation + session id from the matched route up front so
+        # the audit ``start`` event is named and records emitted while handling a
+        # session-scoped request inherit the session id (ambient, from the route
+        # ``{session_id}`` param — set to None for non-session routes so no stale
+        # value leaks and no non-session route is mis-attributed).
+        operation, audit_route, audit_session_id = _resolve_audit_route(request)
+        set_current_session_id(audit_session_id)
+        reset_request_audit_attrs()
+        if operation == "create_session":
+            _logger.info(
+                "Session creation requested",
+                extra=debug_event("session_creation_started", operation="create"),
+            )
+        # ``post_event`` is hit per streamed chunk (the harness echoes its own
+        # output back), so a per-call ``start`` row is pure noise — emit only the
+        # end row for it (and the handler suppresses even that for transient
+        # types). Every other operation keeps its real-time ``start``.
+        if operation != "post_event":
+            _emit_audit_event(
+                operation,
+                "start",
+                session_id=audit_session_id,
+                route=audit_route,
+                method=request.method,
+                request_id=request_id,
+            )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
@@ -1541,6 +2204,27 @@ def create_app(
             status_code = response.status_code
             response.headers["X-Request-Id"] = request_id
             return response
+        except RuntimeError as exc:
+            if str(exc) != _NO_RESPONSE_RETURNED:
+                failed = True
+                raise
+            # The downstream app was cancelled mid-flight (client disconnect /
+            # request teardown) before sending anything: BaseHTTPMiddleware
+            # captures every Exception it raises, so an empty response stream
+            # means a bare CancelledError escaped. A client-gone teardown, not
+            # a server fault — book a benign 499 instead of letting the
+            # catch-all log it as an unhandled UNKNOWN 500.
+            status_code = _HTTP_CLIENT_CLOSED_REQUEST
+            _logger.info(
+                "Request cancelled before a response was sent "
+                "(client disconnect / request teardown): %s %s",
+                request.method,
+                request.url.path,
+            )
+            return Response(
+                status_code=_HTTP_CLIENT_CLOSED_REQUEST,
+                headers={"X-Request-Id": request_id},
+            )
         except Exception:
             failed = True
             raise
@@ -1552,6 +2236,74 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            # Handler-attached attributes ride the end event. A handler that
+            # learns the session id mid-request (create_session, launch_runner —
+            # routes with no {session_id} path param) puts it in the bag; the
+            # BaseHTTPMiddleware runs the handler in a child context, so a
+            # ContextVar it sets there would not be visible here, but the bag is a
+            # shared dict, so it is. The bag's session_id becomes the row's column
+            # (not an attribute). Other reserved keys are dropped so a handler can
+            # never shadow an envelope field or collide with an _emit_audit_event
+            # argument (session_id / phase would raise TypeError).
+            _bag = current_request_audit_attrs()
+            if operation == "create_session":
+                creation_failed = failed or status_code is None or status_code >= 400
+                creation_log = _logger.error if creation_failed else _logger.info
+                creation_log(
+                    "Session creation request finished",
+                    extra=debug_event(
+                        "session_creation_failed"
+                        if creation_failed
+                        else "session_creation_accepted",
+                        session_id=_bag.get("session_id"),
+                        runner_id=_bag.get("runner_id"),
+                        operation="create",
+                        creation_kind=_bag.get("creation_kind", "unknown"),
+                        host_type=_bag.get("host_type", "unknown"),
+                        create_persistence_ms=_bag.get("create_persistence_ms"),
+                        create_identity_ms=_bag.get("create_identity_ms"),
+                        create_acl_ms=_bag.get("create_acl_ms"),
+                        stage="create_request",
+                        status_code=status_code,
+                        error_code=(
+                            _bag.get("code")
+                            or (f"http_{status_code}" if status_code else "request_interrupted")
+                        )
+                        if creation_failed
+                        else None,
+                    ),
+                )
+            # A handler can suppress the whole envelope for this request (e.g. a
+            # transient POST /events echo). An error still logs — a failure is
+            # never noise, and the exception handler carries the detail.
+            if _bag.get("_suppress") and not request_failed:
+                pass
+            else:
+                end_session_id = _bag.get("session_id") or audit_session_id
+                _reserved = {
+                    "_suppress",
+                    "session_id",
+                    "phase",
+                    "route",
+                    "method",
+                    "request_id",
+                    "status",
+                    "duration_ms",
+                }
+                end_attributes = {k: v for k, v in _bag.items() if k not in _reserved}
+                end_attributes.update(
+                    route=audit_route,
+                    method=request.method,
+                    request_id=request_id,
+                    status=str(status_code) if status_code is not None else "none",
+                    duration_ms=str(round(duration_seconds * 1000)),
+                )
+                _emit_audit_event(
+                    operation,
+                    "error" if request_failed else "ok",
+                    session_id=end_session_id,
+                    **end_attributes,
+                )
             # Per-route tally (low-cardinality template key) for offline
             # request-breakdown analysis, e.g. the benchmark harness's
             # per-journey network appendix. Cheap; independent of the OTel path.
@@ -1581,23 +2333,139 @@ def create_app(
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
-        if exc.http_status >= 500:
+        # Stamp attribution onto the per-request audit-envelope row (table-only,
+        # one per request) for EVERY code, so the 4xx we deliberately don't log
+        # to the ERROR stream are still queryable by owner/impact/phase. The
+        # dedicated ERROR/WARN logs below stay reserved for the 5xx and the
+        # offline-runner state, keeping the ERROR stream low-noise (see #6242).
+        add_audit_attrs(
+            code=str(exc.code),
+            http_status=str(exc.http_status),
+            error_category=exc.category.value,
+            error_impact=exc.impact.value,
+            error_phase=exc.phase.value,
+        )
+        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+            # A session state, not a fault: the user's machine is asleep or
+            # the host disconnected, and clients render it as a reconnect
+            # affordance. Through the 5xx arm every poll of an offline
+            # session added an "Internal error" plus a stack, which is what
+            # buried the real 500s.
+            _logger.warning(
+                "Runner unavailable: %s",
+                exc.message,
+                extra=_error_audit_extra(
+                    request,
+                    phase="unavailable",
+                    code=str(exc.code),
+                    http_status="503",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
+                ),
+            )
+        elif exc.http_status >= 500:
             _logger.error(
                 "Internal error: %s",
                 exc.message,
                 exc_info=exc,
-                extra={"session_id": _session_id_from_request(request)},
+                extra=_error_audit_extra(
+                    request,
+                    code=str(exc.code),
+                    http_status=str(exc.http_status),
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
+                ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s",
                 request.url.path,
                 exc.message,
-                extra={"session_id": _session_id_from_request(request)},
+                extra=_error_audit_extra(
+                    request,
+                    phase="rejected",
+                    code=str(exc.code),
+                    http_status="400",
+                    error_category=exc.category.value,
+                    error_impact=exc.impact.value,
+                    error_phase=exc.phase.value,
+                ),
             )
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        """Attribute schema-validation rejections, then return the stock 422 body.
+
+        A schema/transport-invalid request is caller-side input (category=user),
+        and it rejects one request without harming the session (impact=benign).
+        Attribution rides the per-request audit row rather than a dedicated
+        ERROR/WARN line; the response is delegated to FastAPI's default handler
+        so the 422 shape is unchanged.
+        """
+        # Attribute on the per-request audit row, not the ERROR stream: a schema
+        # rejection is expected, low-signal caller input, so it should be
+        # queryable without adding noise where the 500s must stand out.
+        add_audit_attrs(
+            code=str(ErrorCode.INVALID_INPUT),
+            http_status="422",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(ConversationNotFoundError)
+    async def _handle_conversation_not_found(
+        request: Request,
+        exc: ConversationNotFoundError,
+    ) -> JSONResponse:
+        """
+        Map a missing conversation row to 404 rather than an unhandled 500.
+
+        Stores raise this when absence is not a benign no-op — creating a child
+        under a parent that is gone, for example. With no handler it reached the
+        catch-all and was booked as ``internal_error``, so a caller referencing
+        a deleted conversation read as a server fault and counted against the
+        mid-session error rate.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
+        :param exc: The store's not-found error.
+        :returns: A 404 JSON response with the ``not_found`` code.
+        """
+        add_audit_attrs(
+            code=str(ErrorCode.NOT_FOUND),
+            http_status="404",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        # Keep a trace: usually a caller referencing a deleted row, but this
+        # branch would otherwise mask a server-side id-threading defect. The
+        # audit extra carries the operation and session id, so a 404 that is
+        # really our bug stays queryable.
+        _logger.info(
+            "Conversation not found, mapped to 404: %s",
+            exc,
+            extra=_error_audit_extra(
+                request,
+                phase="not_found",
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+            ),
+        )
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
         )
 
     @app.exception_handler(StatementError)
@@ -1621,6 +2489,15 @@ def create_app(
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
         if isinstance(exc.orig, InvalidUuidError):
+            # A malformed id is caller-side input (a value no row can ever
+            # address), not a human referencing a real-but-gone one.
+            add_audit_attrs(
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+                error_category=ErrorCategory.USER.value,
+                error_impact=ErrorImpact.BENIGN.value,
+                error_phase=ErrorPhase.REQUEST.value,
+            )
             # Keep a trace: a malformed id is usually a client bug, but this
             # branch would otherwise mask a server-side id-generation defect
             # as a routine 404.
@@ -1633,7 +2510,14 @@ def create_app(
             "Database error: %s",
             exc,
             exc_info=exc,
-            extra={"session_id": _session_id_from_request(request)},
+            extra=_error_audit_extra(
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.SERVER.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+            ),
         )
         return JSONResponse(
             status_code=500,
@@ -1660,14 +2544,79 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        if is_cancelled_rpc_error(exc):
+            # A peer-cancelled backing call (upstream teardown/restart) is an
+            # expected, retryable condition, not a fault: attribute it as
+            # transient upstream at WARNING — keeping the ERROR stream for real
+            # 500s — and answer with the coded 499 via the standard handler.
+            cancelled = OmnigentError(
+                "The backing service cancelled the call; please retry.",
+                code=ErrorCode.UPSTREAM_CANCELLED,
+            )
+            _logger.warning(
+                "Upstream call cancelled by its peer: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="cancelled",
+                    code=str(cancelled.code),
+                    http_status=str(cancelled.http_status),
+                    error_category=cancelled.category.value,
+                    error_impact=cancelled.impact.value,
+                    error_phase=cancelled.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, cancelled)
+        if is_permission_denied_rpc_error(exc):
+            # An upstream PERMISSION_DENIED (e.g. a proxied workspace-hierarchy
+            # 403) is an access outcome, not a fault: answer the coded 403 naming
+            # the resource instead of an unhandled 500 on every client retry.
+            denied = OmnigentError(
+                f"Access to {request.url.path} was denied by a backing "
+                "service. Verify you still have access to the underlying "
+                "resource, or ask an administrator to grant it.",
+                code=ErrorCode.UPSTREAM_PERMISSION_DENIED,
+            )
+            _logger.warning(
+                "Upstream call denied by a backing service: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="denied",
+                    code=str(denied.code),
+                    http_status=str(denied.http_status),
+                    error_category=denied.category.value,
+                    error_impact=denied.impact.value,
+                    error_phase=denied.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, denied)
+        # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
+        # fault is ours. Booking it as server would inflate our fault rate; the
+        # exception type is logged as a signature to rank for promotion to a real
+        # category. The client still gets internal_error / 500.
         _logger.error(
             "Unhandled exception: %s",
             exc,
             exc_info=exc,
-            extra={"session_id": _session_id_from_request(request)},
+            extra=_error_audit_extra(
+                request,
+                code=str(ErrorCode.INTERNAL_ERROR),
+                http_status="500",
+                error_category=ErrorCategory.UNKNOWN.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=ErrorPhase.UNKNOWN.value,
+                error_type=type(exc).__name__,
+            ),
         )
+        request_id = getattr(request.state, "audit_request_id", None)
         return JSONResponse(
             status_code=500,
+            headers={"X-Request-Id": request_id} if isinstance(request_id, str) else None,
             content={
                 "error": {
                     "code": ErrorCode.INTERNAL_ERROR,
@@ -1989,6 +2938,25 @@ def create_app(
            version number: ``server_picker`` is ``"sidebar"`` on builds that
            dock the picker at the sidebar's bottom (it was ``"titlebar"``,
            centered in the macOS title-bar strip, before this).
+        5. ``auth`` tells a native client how this server signs users in,
+           before it loads anything. ``mode`` is ``"oidc"``, ``"accounts"``,
+           ``"header"``, ``"custom"`` (an embedding app's own provider), or
+           ``"none"``. ``"oidc"`` also promises the native loopback sign-in
+           (``/auth/login`` native parameters + ``POST /auth/native-token``).
+           ``session_cookie`` names the session cookie for ``oidc`` and
+           ``accounts`` and is ``null`` otherwise. ``native_redirect_uris``
+           lists the private-use-scheme redirects (the iOS and Android apps'
+           ``ai.omnigent.ios:/oauth/callback`` and
+           ``ai.omnigent.android:/oauth/callback``) the native sign-in accepts
+           besides loopback, sorted, for ``oidc``; ``null`` otherwise. Each
+           app gates on its own URI being listed, because servers that don't
+           accept it answer that redirect with 400. A missing
+           ``auth`` (older servers) means "sign in as before".
+        6. ``server_name`` (str | null) is the operator's display name for
+           this deployment (``branding.server_name``), for clients that list
+           several servers. Self-asserted by the server, so clients show it
+           for display only and keep the host in any trust decision. Null
+           when unset; it never falls back to ``branding.app_name``.
 
         Unknown fields MUST be ignored, and a missing manifest (404 — every
         server older than this route) MUST be treated as the pre-manifest
@@ -1999,14 +2967,22 @@ def create_app(
         Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
         must be able to read this before it holds a session cookie — the whole
         point is to consult it before loading the app. It exposes only the
-        version already public via ``/api/version`` plus coarse UI-shape
-        strings, so there is nothing here to leak.
+        version already public via ``/api/version``, coarse UI-shape
+        strings, and the sign-in mode and cookie name any visitor already
+        learns from ``/v1/info`` and the login redirect, so there is
+        nothing here to leak.
 
         Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
         guessable path that never collides with an SPA client route.
 
         :returns: The manifest described above.
         """
+        mode = auth_mode(auth_provider)
+        native_redirect_uris: list[str] | None = None
+        if mode == "oidc":
+            from omnigent.server.routes.auth import NATIVE_APP_REDIRECT_URIS
+
+            native_redirect_uris = sorted(NATIVE_APP_REDIRECT_URIS)
         return {
             "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
             "server_version": _server_version(),
@@ -2015,6 +2991,12 @@ def create_app(
             # key existing and exercise the "no floor" path from day one.
             "min_desktop_version": None,
             "ui": {"server_picker": "sidebar"},
+            "auth": {
+                "mode": mode,
+                "session_cookie": getattr(auth_provider, "session_cookie_name", None),
+                "native_redirect_uris": native_redirect_uris,
+            },
+            "server_name": branding_snapshot.server_name,
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
@@ -2043,11 +3025,10 @@ def create_app(
         sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
-        from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
+        from omnigent.server.auth import local_single_user_enabled
 
-        accounts_enabled = (
-            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
-        )
+        # Same helper as the manifest's auth.mode, so the two never disagree.
+        accounts_enabled = auth_mode(auth_provider) == "accounts"
         login_url = getattr(auth_provider, "login_url", None)
         # single_user marks the explicit single-user local runtime
         # (OMNIGENT_LOCAL_SINGLE_USER=1, set by the managed local spawn paths).
@@ -2093,10 +3074,25 @@ def create_app(
         managed_sandboxes_enabled = False
         sandbox_provider = None
         sandbox_providers: list[str] = []
+        sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
+            sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+        # enabled_connections lists the connection providers this deploy has
+        # wired (config + store present), in a stable order. The web UI shows
+        # the Sandbox Integrations nav when the list is non-empty and renders
+        # one panel per provider. A provider appears only when both its config
+        # and its connection store are present.
+        enabled_connections = [
+            provider
+            for provider in ("github", "databricks")
+            if getattr(app.state, f"{provider}_config", None) is not None
+            and getattr(app.state, f"{provider}_store", None) is not None
+        ]
+        if mcp_registry is not None:
+            enabled_connections.append("mcp")
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2158,10 +3154,14 @@ def create_app(
                 "needs_setup": needs_setup,
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "durable_initial_input": startup_inputs is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
+                "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
+                "public_sharing_max_level": app.state.public_sharing_max_level().value,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
@@ -2169,6 +3169,12 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "archive_worktree_cleanup": True,
+                "request_managed_sandbox_host_id": True,
+                "agent_install": agent_store.supports_user_agents,
+                "agent_detail": True,
+                "agent_config_edit": agent_store.supports_config_edit
+                and artifact_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -2218,6 +3224,11 @@ def create_app(
         EVERY mode, including OIDC/SSO where the accounts-only
         ``/auth/me`` endpoint does not exist.
 
+        An identity the admin list names but the database doesn't yet
+        flag is promoted here, as login does for OIDC and accounts.
+        Header auth has no login step, so without this a listed admin
+        would see admin chrome that every admin-gated route refuses.
+
         When OIDC is active and the user is unauthenticated,
         returns 401 with a ``login_url`` so the frontend knows
         where to redirect.
@@ -2236,17 +3247,20 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        # Mirror the admin check the auth routes use
-        # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
-        # so the SPA's admin chrome never under-reports relative to what the
-        # endpoints actually authorize — e.g. for an identity added to the
-        # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
-        # hasn't flipped the DB flag).
-        is_admin = user_id is not None and (
-            (permission_store is not None and permission_store.is_admin(user_id))
-            or admin_list.is_admin(user_id)
-        )
-        return {"user_id": user_id, "is_admin": is_admin}
+        if user_id is None:
+            return {"user_id": None, "is_admin": False}
+        listed = admin_list.is_admin(user_id)
+        flagged = permission_store is not None and permission_store.is_admin(user_id)
+        if listed and not flagged and permission_store is not None:
+            # Same promotion OIDC runs at login (see routes/auth.py). Best-effort:
+            # a failed write must not break identity resolution.
+            try:
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+                await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
+            except Exception:  # noqa: BLE001
+                _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
+        # Still report the list, so admin chrome shows even if promotion failed.
+        return {"user_id": user_id, "is_admin": flagged or listed}
 
     app.include_router(
         create_sessions_router(
@@ -2281,9 +3295,30 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            register_startup_dispatch=lambda handler: (
+                setattr(startup_inputs, "dispatch", handler)
+                if startup_inputs is not None
+                else None
+            ),
+            register_initial_file_upload=lambda handler: setattr(
+                app.state, "initial_file_upload", handler
+            ),
+            register_runner_ingest=lambda handler: setattr(
+                app.state, "runner_event_ingest", handler
+            ),
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    from omnigent.server.mcp_policy_adapter import McpPolicyAdapter
+    from omnigent.server.routes.mcp_gateway import create_mcp_gateway_router
+
+    app.include_router(
+        create_mcp_gateway_router(
+            McpPolicyAdapter(conversation_store, agent_store, auth_provider, permission_store)
+        ),
+        prefix="/v1",
+        tags=["mcp_gateway"],
     )
     app.include_router(
         create_imports_router(
@@ -2291,6 +3326,7 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            project_store=project_store,
             host_registry=host_registry,
             host_store=host_store,
         ),
@@ -2308,13 +3344,14 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
-    # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
-    # Successor to the removed GET /api/agents list; lists only
-    # built-in (session_id IS NULL) agents for the new-session picker.
+    # Server agent discovery for the new-session picker
+    # (designs/BUILTIN_AGENTS.md), plus user agents (``omnigent agent add``).
     app.include_router(
         create_builtin_agents_router(
             agent_store,
             agent_cache,
+            artifact_store=artifact_store,
+            conversation_store=conversation_store,
             auth_provider=auth_provider,
         ),
         prefix="/v1",
@@ -2324,6 +3361,38 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    app.include_router(
+        create_extensions_router(
+            resolved_extension_state,
+            bundles=extension_bundles,
+            asset_errors=extension_asset_errors,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
+    app.include_router(
+        create_extension_assets_router(
+            extension_bundles,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["extensions"],
+    )
+    from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+
+    app.include_router(
+        create_sandbox_inference_router(
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["sandbox inference"],
     )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
@@ -2400,6 +3469,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
+                artifact_store=artifact_store,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
@@ -2415,7 +3485,6 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
-
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:
@@ -2443,38 +3512,79 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
-    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
-        """Reconcile a dropped runner's sessions once the grace expires.
+    async def _mark_disconnected_runner_failed(
+        runner_id: str, reference_stamp: int | None, *, idle_shutdown: bool = False
+    ) -> None:
+        """Reconcile a dropped runner's sessions once the liveness lease expires.
 
-        A runner that re-registered inside the grace makes this a no-op
-        via the live-tunnel re-check (the same newest-wins rule the
-        immediate path used); one still gone hands its bound sessions to
+        Waits for the runner to re-register on this replica, event-driven,
+        for the whole liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`,
+        sized to :data:`RUNNER_LIVENESS_TTL_S`). A reconnect resolves the
+        wait at once and makes this a no-op, so a Wi-Fi roam, VPN stall,
+        ingress recycle, or sleep/resume that comes back within the lease
+        never flaps its sessions to failed. A runner still absent when the
+        lease expires hands its bound sessions to
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
+
+        This is the transport-drop path only. A runner that actually
+        crashed is reported by its daemon on the host tunnel and handled by
+        :func:`_on_runner_exited`, which fails fast and cancels this timer,
+        so waiting out the lease here costs nothing on real death.
 
         A server that is itself shutting down skips the marking too: it
         closed the tunnel, and the runner cannot re-register with a
         process that stopped listening — the replacement server re-adopts
         it on reconnect (:mod:`omnigent.server.shutdown_state`).
 
+        A runner confirmed live on another replica (via
+        :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
+        replica's tunnel is authoritative now, and this one's registry
+        only ever knew about its own connections.
+
         :param runner_id: The disconnected runner's id.
+        :param reference_stamp: This replica's own last liveness stamp for
+            *runner_id*, captured in :func:`_on_runner_disconnect` before
+            the clear — the reference the cross-replica check compares
+            against.
+        :param idle_shutdown: Whether the runner closed with
+            ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``. Its idle watchdog found no
+            active work, so a stale mid-turn status is settled like a Stop.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
+            _note_runner_idle_shutdown,
+            _relinquish_session_live_state,
+            _runner_live_on_another_replica_from_conversations,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        # Event-driven: `register` resolves the wait the instant the runner
+        # reconnects here. A non-positive grace collapses to an immediate
+        # registry check, matching the sleep(0) behavior tests pin.
+        reconnected = await tunnel_registry.wait_for_runner(
+            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
+        )
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
                 runner_id,
             )
             return
-        if tunnel_registry.get(runner_id) is not None:
+        # The same holds for one runner this replica handed to another replica.
+        handoff_reason = shutdown_state.runner_handoff_reason(runner_id)
+        if handoff_reason is not None:
             _logger.info(
-                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
+                "Runner %s dropped because this server handed it off (%s); "
+                "skipping offline-marking",
+                runner_id,
+                handoff_reason,
+            )
+            return
+        if reconnected is not None:
+            _logger.info(
+                "Runner %s reconnected within the liveness lease; skipping offline-marking",
                 runner_id,
             )
             return
@@ -2488,11 +3598,42 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
-        _logger.warning(
-            "Runner %s disconnected; reconciling %d bound session(s)",
-            runner_id,
-            len(affected),
-        )
+        # The runner may reconnect while the store returns an older snapshot.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s reconnected during offline lookup; skipping offline-marking",
+                runner_id,
+            )
+            return
+        if _runner_live_on_another_replica_from_conversations(
+            affected, runner_id, reference_stamp
+        ):
+            for conv in affected:
+                _relinquish_session_live_state(conv.id)
+            _logger.info(
+                "Runner %s is live on another replica; skipping offline-marking",
+                runner_id,
+            )
+            return
+        if idle_shutdown:
+            # The sweep's stop path settles these to idle instead of failing them.
+            _note_runner_idle_shutdown(runner_id, affected)
+            _logger.info(
+                "Runner %s shut down with no active work; settling %d bound session(s)",
+                runner_id,
+                len(affected),
+                extra=debug_event(
+                    "runner_idle_shutdown",
+                    runner_id=runner_id,
+                    session_count=len(affected),
+                ),
+            )
+        else:
+            _logger.warning(
+                "Runner %s disconnected; reconciling %d bound session(s)",
+                runner_id,
+                len(affected),
+            )
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(
@@ -2502,7 +3643,7 @@ def create_app(
             conversation_store,
         )
 
-    async def _on_runner_disconnect(runner_id: str) -> None:
+    async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
@@ -2523,7 +3664,13 @@ def create_app(
         reconnect re-initialization still happens.
 
         :param runner_id: The disconnected runner's id.
+        :param connection: The closed tunnel whose generation scopes
+            initialization cleanup.
         """
+        cancelled = runner_session_initializer.invalidate_runner(
+            runner_id, generation=connection.generation
+        )
+        await asyncio.gather(*cancelled, return_exceptions=True)
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
         # registered (``TunnelRegistry.register`` retires the old
@@ -2542,16 +3689,47 @@ def create_app(
                 runner_id,
             )
             return
-        runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
+        from omnigent.server.routes.sessions import _note_runner_idle_shutdown
+
+        idle_shutdown = connection.peer_close_reason == RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+        _logger.info(
+            "Runner disconnected",
+            extra=debug_event(
+                "runner_disconnected",
+                runner_id=runner_id,
+                peer_close_reason=connection.peer_close_reason,
+                idle_shutdown=idle_shutdown,
+                **shutdown_state.disconnect_attributes(runner_id),
+            ),
+        )
+        if idle_shutdown:
+            # Relays decide at the same deadline as the grace timer below and
+            # would fail a stale mid-turn status first; mark them now.
+            _note_runner_idle_shutdown(runner_id)
+        # Capture this replica's own last stamp before clearing, so the grace
+        # timer can tell a fresher stamp another replica writes later from
+        # one we wrote ourselves (the clear itself never erases this record).
+        reference_stamp = session_live_state.last_liveness_stamp(runner_id)
+        # Graceful disconnect: clear the persisted liveness stamp so other replicas
+        # flip offline at once. Not on our own shutdown or a handoff: the runner is
+        # alive and re-tunnels elsewhere, which must not settle its turns to idle.
+        if (
+            shutdown_state.server_shutting_down()
+            or shutdown_state.runner_handoff_reason(runner_id) is not None
+        ):
+            session_live_state.touch_runner_liveness([runner_id])
+        else:
+            session_live_state.clear_runner_liveness(runner_id)
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id),
+            _mark_disconnected_runner_failed(
+                runner_id,
+                reference_stamp,
+                idle_shutdown=idle_shutdown,
+            ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
@@ -2562,7 +3740,7 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
-    async def _on_runner_exited(runner_id: str, error: str) -> None:
+    async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
         Fired by the host tunnel when a daemon reports
@@ -2571,15 +3749,19 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout. An idle
-        top-level session is included for exactly that reason; an idle
-        sub-agent is not, since its work finished on a runner that was
-        already live.
+        instead of spinning on "starting" until a timeout. Only a runner
+        that never connected fails an idle top-level session for that
+        reason: when the host dies after the runner ran, an idle session
+        lost no work and stays idle (offline via liveness). An idle
+        sub-agent is not failed either way, since its work finished on a
+        runner that was already live.
 
+        :param host_id: The reporting host's id.
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
+        from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
@@ -2587,130 +3769,360 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
-        affected = await asyncio.to_thread(
-            conversation_store.list_conversations_by_runner_id, runner_id
+        # Host connection evidence survives tunnel moves between replicas. Older
+        # hosts fall back to this replica's observed liveness.
+        runner_ran = (
+            runner_exit_reports.was_connected(runner_id)
+            or session_live_state.last_liveness_stamp(runner_id) is not None
         )
-        _logger.warning(
-            "Runner %s reported crashed; reconciling %d bound session(s): %s",
-            runner_id,
-            len(affected),
-            error,
-        )
+        try:
+            affected = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+        except Exception:
+            # Never lose the crash event to a failed session lookup.
+            log_runner_exited(host_id, runner_id, error)
+            raise
+        # One row per bound session so every crash is attributable; a runner
+        # with no bound session still gets a session-less row.
+        for session_id in [conv.id for conv in affected] or [None]:
+            log_runner_exited(host_id, runner_id, error, session_id=session_id)
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
             conversation_store,
-            fail_idle_top_level=True,
+            fail_idle_top_level=not runner_ran,
         )
 
-    async def _on_runner_connect(runner_id: str) -> None:
-        """Re-assign sessions and restart SSE relays on reconnect.
-
-        Resolves the runner client per-session via
-        ``runner_router.client_for_session_resources``. The legacy
-        ``get_runner_client()`` returns ``None`` in multi-runner
-        deployments where only ``set_runner_router`` is wired, so
-        routing must go through the router.
-
-        :param runner_id: The reconnecting runner's id.
-        """
+    async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
+        """Attach bound streams, then recover independent session trees concurrently."""
+        from omnigent.entities import Conversation
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+        from omnigent.server.child_session_recovery import (
+            RECOVERY_STORE_CONCURRENCY,
+            _interrupted,
+            _restorable,
+            is_parent_owned_subagent,
+            restore_active_children,
+        )
+        from omnigent.server.routes._sessions.common import (
+            _session_sandbox_status_cache,
+            _session_status_cache,
+        )
+        from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
 
-        # Stamp liveness immediately so other replicas see the runner
-        # online before the first periodic sweep.
+        if tunnel_registry.get(runner_id) is not connection:
+            return
+        _logger.info(
+            "Runner connected",
+            extra=debug_event("runner_connected", runner_id=runner_id),
+        )
+        # A runner back on this replica is this replica's to reconcile again.
+        shutdown_state.clear_runner_handoff(runner_id)
+        # Other replicas must see the runner online before the first liveness sweep.
         session_live_state.touch_runner_liveness([runner_id])
-
-        # Direct by-runner lookup instead of list-everything-and-filter:
-        # the listing path may be backed by an eventually-consistent
-        # search index in alternate store backends, which cannot see a
-        # session created seconds ago — exactly the window this callback
-        # runs in for a host-spawned runner. Missing the session here
-        # means create_session never reaches the runner and the
-        # claude-native terminal is never bootstrapped. Archived
-        # sessions are included by construction (their relays must
-        # restart on reconnect like any other).
+        # The by-runner lookup is read-after-write consistent and includes archived
+        # sessions, whose streams still need to be attached after a reconnect.
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
-        _logger.info(
-            "_on_runner_connect: runner=%s, %d bound session(s)",
-            runner_id,
-            len(convs),
-        )
+        bound_ids = {conv.id for conv in convs}
+
+        def is_independent(conv: Conversation) -> bool:
+            return not (
+                is_parent_owned_subagent(conv)
+                or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
+            )
+
+        def needs_eager_recovery(conv: Conversation) -> bool:
+            if conv.archived:
+                return False
+            # Idle runtimes are recreated on their next interaction. Unknown,
+            # in-flight, failed, and approval-blocked sessions recover now.
+            status = _session_status_cache.get(conv.id, conv.live_status)
+            pending = max(
+                conv.pending_elicitation_count or 0,
+                pending_elicitations.count_for(conv.id),
+            )
+            return (
+                status != "idle"
+                or pending > 0
+                or _last_task_error_from_labels(conv.labels) is not None
+            )
+
+        by_id = {conv.id: conv for conv in convs}
+
+        def independent_root_id(conv: Conversation) -> str | None:
+            seen: set[str] = set()
+            while not is_independent(conv):
+                if conv.id in seen or conv.parent_conversation_id is None:
+                    return None
+                seen.add(conv.id)
+                parent = by_id.get(conv.parent_conversation_id)
+                if parent is None:
+                    return None
+                conv = parent
+            return conv.id
+
+        eager_root_ids: set[str] = set()
         for conv in convs:
-            _logger.info(
-                "_on_runner_connect: matched %s (agent=%s)",
-                conv.id,
-                conv.agent_id,
-            )
-            try:
-                routed = runner_router.client_for_session_resources(conv.id)
-            except OmnigentError:
-                _logger.exception(
-                    "Failed to resolve runner client for session %s on reconnect",
-                    conv.id,
-                )
+            if not needs_eager_recovery(conv):
                 continue
-            if not conv.agent_id:
-                # The runner's create_session requires agent_id (it 400s
-                # without one), so don't send a request it rejects by
-                # contract. The old list path filtered these rows out via
-                # has_agent_id=True; the by-runner lookup returns them, and
-                # the relay restart below still applies — the session is
-                # runner-bound regardless of having an agent.
-                _logger.debug(
-                    "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
-                    conv.id,
-                )
-            else:
+            root_id = independent_root_id(conv)
+            if root_id is not None and not by_id[root_id].archived:
+                eager_root_ids.add(root_id)
+
+        # Attach independent roots first; their recovery restores dependent sessions.
+        convs.sort(key=lambda conv: not is_independent(conv))
+        _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
+        roots: list[tuple[Conversation, httpx.AsyncClient]] = []
+        store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
+        for _, candidates in groupby(convs, key=is_independent):
+            # Awaited reads let attachment yield between batches, even for native mirrors.
+            for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
                 try:
-                    await runner_session_initializer.initialize(
-                        conv,
-                        routed.client,
-                        timeout=10.0,
-                    )
+                    async with store_slots:
+                        current = await asyncio.to_thread(
+                            conversation_store.get_conversations, [conv.id for conv in batch]
+                        )
                 except Exception:
+                    # A failed lookup must not strand the remaining batches.
                     _logger.exception(
-                        "Failed to re-assign session %s on reconnect",
-                        conv.id,
+                        "Failed to refresh session bindings for runner %s on reconnect", runner_id
                     )
-            _ensure_runner_relay(
-                conv.id,
-                runner_id,
-                routed.client,
-                conversation_store,
-            )
-            # The session's terminal exists as of the handshake above, so its
-            # model catalogs are answerable now. Warming them here is what
-            # keeps the first routed message off the runner round trip. The
-            # helper self-gates on routing state, so the plain sessions in this
-            # loop (and any archived row) cost nothing.
-            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-            # Reconcile the persisted pending-elicitation count with this
-            # pod's live index. A runner that crashed with prompts parked
-            # leaves a stale row (no decrement is ever written on a crash),
-            # which the fresh index corrects to 0 here; a tunnel flap on the
-            # same pod resyncs the still-parked truth unchanged.
-            session_live_state.persist_pending_count(
-                conv.id, pending_elicitations.count_for(conv.id)
-            )
-            # A reconnect can land the runner back on an idle session with
-            # no new turn (a transient WS blip; the runner process
-            # survived). The disconnect left the session marked failed with
-            # persisted ``runner_disconnected`` labels, and without a
-            # ``running`` edge nothing clears them — the Subagents panel
-            # keeps the grey "Disconnected" dot until the next user
-            # message. Clearing on reconnect drops it as soon as the runner
-            # is reachable again. The helper self-guards: it only clears a
-            # session whose persisted failure is ``runner_disconnected``, so
-            # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
+                    continue
+                if tunnel_registry.get(runner_id) is not connection:
+                    return
+                for snapshot in batch:
+                    conv = current.get(snapshot.id)
+                    if conv is None or conv.runner_id != runner_id:
+                        continue
+                    with runner_log_scope(conv.id, runner_id):
+                        _logger.info(
+                            "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
+                        )
+                        try:
+                            routed = runner_router.client_for_session_resources(
+                                conv.id, conversation=conv
+                            )
+                        except OmnigentError as exc:
+                            if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
+                                # The runner dropped again before we reached this session.
+                                _logger.warning(
+                                    "Runner %s went offline before session %s was re-attached",
+                                    runner_id,
+                                    conv.id,
+                                    extra=debug_event(
+                                        "runner_reconnect_client_offline",
+                                        runner_id=runner_id,
+                                        error_code=exc.code,
+                                    ),
+                                )
+                            else:
+                                _logger.exception(
+                                    "Failed to resolve runner client for session %s on reconnect",
+                                    conv.id,
+                                )
+                            continue
+                        if routed.runner_id != runner_id:
+                            continue
+                        _ensure_runner_relay(
+                            conv.id,
+                            runner_id,
+                            routed.client,
+                            conversation_store,
+                            conversation=conv,
+                        )
+                        if is_independent(conv):
+                            roots.append((conv, routed.client))
+                        else:
+                            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                        # A crash can leave a persisted count absent from the live index.
+                        session_live_state.persist_pending_count(
+                            conv.id, pending_elicitations.count_for(conv.id)
+                        )
+                        cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+                        # A reconnect proves readiness only for a launch already marked failed.
+                        if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                            _publish_sandbox_status(conv.id, "ready")
+
+        # Descendants on an offline runner are absent from the bound-session lookup.
+        # Scan attached idle trees in bounded pages before recovering their roots.
+        frontier = {
+            conv.id: conv.id
+            for conv, _ in roots
+            if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
+        }
+        idle_root_ids = set(frontier.values())
+        try:
+            while frontier:
+                next_frontier: dict[str, str] = {}
+                for parent_id, root_id in frontier.items():
+                    if root_id in eager_root_ids:
+                        continue
+                    cursor: tuple[int, str] | None = None
+                    while True:
+                        async with store_slots:
+                            pairs = await asyncio.to_thread(
+                                conversation_store.list_child_conversation_ids_page,
+                                parent_id,
+                                after=cursor,
+                                limit=_RECONNECT_BINDING_BATCH_SIZE,
+                            )
+                        if not pairs:
+                            break
+                        child_id, created_at = pairs[-1]
+                        cursor = (created_at, child_id)
+                        async with store_slots:
+                            rows = await asyncio.to_thread(
+                                conversation_store.get_conversations,
+                                [child_id for child_id, _ in pairs],
+                            )
+                        for child_id, _ in pairs:
+                            row = rows.get(child_id)
+                            if (
+                                row is None
+                                or row.host_id is not None
+                                or row.runner_id is None
+                                or not _restorable(row)
+                                or is_side_chat_child(row.labels)
+                            ):
+                                continue
+                            if row.runner_id != runner_id and runner_router.runner_is_online(
+                                row.runner_id
+                            ):
+                                continue
+                            if row.runner_id != runner_id and _interrupted(row):
+                                eager_root_ids.add(root_id)
+                                break
+                            next_frontier[row.id] = root_id
+                        if root_id in eager_root_ids or len(pairs) < _RECONNECT_BINDING_BATCH_SIZE:
+                            break
+                frontier = next_frontier
+        except Exception:
+            # A failed classification must not prevent eager recovery.
+            _logger.exception("Failed to classify child recovery for runner %s", runner_id)
+            eager_root_ids.update(idle_root_ids)
+
+        async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
+            with runner_log_scope(conv.id, runner_id):
+                try:
+                    async with store_slots:
+                        fresh = await asyncio.to_thread(
+                            conversation_store.get_conversation, conv.id
+                        )
+                    if fresh is None or fresh.runner_id != runner_id:
+                        return
+                    conv = fresh
+                    runner_session_initializer.require_generation(
+                        runner_id, client, connection.generation
+                    )
+                    initialize_runtime = (
+                        conv.agent_id is not None
+                        and not conv.archived
+                        and (conv.id in eager_root_ids or needs_eager_recovery(conv))
+                    )
+                    # Idle trees reinitialize on demand; active trees recover now.
+                    if not initialize_runtime:
+                        if conv.agent_id is None:
+                            reason = "no_agent"
+                        elif conv.archived:
+                            reason = "archived"
+                        else:
+                            reason = "idle"
+                        _logger.info(
+                            "Deferred runner session init until first use: session=%s reason=%s",
+                            conv.id,
+                            reason,
+                            extra=debug_event(
+                                "runner_session_init_deferred",
+                                reason=reason,
+                            ),
+                        )
+                    if initialize_runtime:
+                        response = await runner_session_initializer.initialize(
+                            conv,
+                            client,
+                            timeout=10.0,
+                            generation=connection.generation,
+                            store_slots=store_slots,
+                        )
+                        # A removed agent was already logged as expected.
+                        if is_session_agent_removed(response):
+                            return
+                        response.raise_for_status()
+                    prefetch_session_routing_catalogs(conv.id, conv, client)
+                    # Clear only a root's disconnect failure, after successful init.
+                    # Children retain interruption evidence until continuation runs.
+                    async with store_slots:
+                        await _publish_runner_recovered_status(
+                            conv.id, conversation_store, require_disconnect_code=True
+                        )
+                    if initialize_runtime:
+                        await restore_active_children(
+                            conv,
+                            client,
+                            conversation_store,
+                            runner_session_initializer,
+                            generation=connection.generation,
+                            store_slots=store_slots,
+                        )
+                except Exception as exc:
+                    if tunnel_registry.get(runner_id) is not connection:
+                        _logger.info(
+                            "Stopped recovering session %s: runner tunnel changed", conv.id
+                        )
+                    elif isinstance(exc, (ConnectionError, httpx.TransportError)):
+                        # Tunnel dropped mid-request; the next reconnect retries.
+                        _logger.warning(
+                            "Lost runner tunnel re-assigning session %s on reconnect (%s: %s)",
+                            conv.id,
+                            type(exc).__name__,
+                            exc,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_lost_tunnel",
+                                exc_type=type(exc).__name__,
+                            ),
+                        )
+                    elif isinstance(exc, httpx.HTTPStatusError):
+                        body = runner_response_error_body(exc.response)
+                        status = exc.response.status_code
+                        log = (
+                            _logger.warning
+                            if status in TRANSIENT_REJECTION_STATUSES
+                            else _logger.error
+                        )
+                        log(
+                            "Failed to re-assign session %s on reconnect: HTTP %d: %s",
+                            conv.id,
+                            status,
+                            body,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_rejected",
+                                status_code=status,
+                                response_body=body,
+                            ),
+                        )
+                    else:
+                        _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
+
+        # A hung initialization delays only its own tree. All tasks are joined and
+        # cancelled with this connection; no detached recovery or shared deadline.
+        async with asyncio.TaskGroup() as recoveries:
+            for conv, client in roots:
+                recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
+
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+        assert runner_account_store is not None and auth_provider is not None
+        return runner_account_store.with_runner_authority(
+            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+        )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -2724,6 +4136,11 @@ def create_app(
         :returns: The session owner's user id, or ``None`` when no session
             is bound to this runner (the handshake is then refused).
         """
+        if runner_account_store is not None:
+            try:
+                return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
+            except OmnigentError:
+                return None
         for conv in conversation_store.list_conversations_by_runner_id(runner_id):
             owner = conversation_store.get_session_owner(conv.id)
             if owner is not None:
@@ -2740,6 +4157,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            mint_managed_runner_token=(
+                _mint_managed_runner_token if runner_account_store is not None else None
+            ),
         ),
         prefix="/v1",
         tags=["runners"],
@@ -2752,11 +4172,19 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        from omnigent.server.routes.harness_startup import create_harness_startup_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+        from omnigent.server.routes.mcp_tools import create_mcp_tools_router
+        from omnigent.server.routes.plugins import create_plugins_router
+        from omnigent.server.routes.skill_content import create_skill_content_router
+        from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
+            if startup_inputs is not None:
+                startup_inputs.host_changed(app, _host_id)
 
         app.include_router(
             create_host_tunnel_router(
@@ -2785,6 +4213,91 @@ def create_app(
             ),
             prefix="/v1",
             tags=["hosts"],
+        )
+        app.include_router(
+            create_skills_router(
+                host_registry,
+                host_store,
+                conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["skills"],
+        )
+        app.include_router(
+            create_harness_startup_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_plugins_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_skill_content_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_mcp_tools_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        # Host-facing credential vending: a sandbox fetches its owner's
+        # per-provider credential over the launch-token-authenticated channel
+        # instead of having it injected. One generic route serves every provider
+        # that registered a credential_resolver (app.state set by the
+        # connection-provider wiring above); it 404s for a provider not
+        # configured on this server, so mounting it unconditionally is safe.
+        #
+        # Registered AFTER create_hosts_router on purpose: its ``{provider}`` path
+        # param would otherwise shadow that router's literal
+        # ``/hosts/{host_id}/credentials/detected`` (Starlette matches in
+        # registration order with no literal-over-parameter priority).
+        from omnigent.server.routes.host_credentials import create_host_credentials_router
+
+        app.include_router(
+            create_host_credentials_router(host_store),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+
+    if mcp_registry is not None:
+        from omnigent.server.routes.mcp_registry import create_mcp_registry_router
+
+        app.include_router(
+            create_mcp_registry_router(mcp_registry, auth_provider),
+            prefix="/v1",
+            tags=["mcp_registry"],
+        )
+
+    # Per-user connection routes (/v1/connections/{provider}/*): connect /
+    # callback / status / disconnect. One registry entry per provider; each is
+    # mounted only when configured (config + store present), so an unconfigured
+    # provider's surface stays absent exactly like a build without the feature.
+    for _provider in connection_providers():
+        _cfg = getattr(app.state, f"{_provider.name}_config", None)
+        _store = getattr(app.state, f"{_provider.name}_store", None)
+        if _cfg is None or _store is None:
+            continue
+        app.include_router(
+            _provider.router_factory(
+                _cfg,
+                _store,
+                auth_provider=auth_provider,
+                client=getattr(app.state, f"{_provider.name}_client", None),
+            ),
+            prefix="/v1",
+            tags=["integrations"],
         )
 
     # Mount the auth router that matches the active provider. OIDC and
@@ -2822,10 +4335,15 @@ def create_app(
             and auth_provider._source == "accounts"
             and account_store is not None
         ):
+            from omnigent.server.auth import AccountAuthenticationMiddleware
             from omnigent.server.routes.accounts_auth import (
                 create_accounts_auth_router,
             )
 
+            # A deleted account's still-signed session JWTs must stop
+            # authenticating; every request checks the generation and tombstone.
+            auth_provider.set_account_check(account_store.accepts_generation)
+            app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -2833,6 +4351,7 @@ def create_app(
                     admin_list,
                     permission_store,
                     device_grant_store,
+                    scheduled_task_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -2874,23 +4393,72 @@ def create_app(
                 type(auth_provider).__name__,
             )
 
+        # Client-credentials grant (RFC 6749 §4.4): a machine client mints a
+        # delegated, path-scoped token with no browser in the loop. It is a
+        # grant_type BRANCH of the one /oauth/token mounted below, never a
+        # second router on that path — FastAPI resolves first-match-wins, so a
+        # duplicate route would be shadowed with no warning. Opt-in and
+        # default-off: the factory returns None unless a machine client is
+        # configured and its principal passes the admin vetting.
+        # See designs/CLIENT_CREDENTIALS.md.
+        handle_client_credentials = None
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.client_credentials import (
+                MachineClientConfig,
+                create_client_credentials_handler,
+            )
+
+            if device_grant_store is None:
+                # Both /oauth/token mounts below need the grant store, so there
+                # is no endpoint to carry this branch. Parse the config anyway:
+                # from_env raises on a malformed one, so an operator error still
+                # surfaces at startup, and a machine client that cannot take
+                # effect is reported rather than silently dropped. Decided here
+                # rather than after building the handler, so the factory never
+                # logs the grant as enabled when nothing can answer it.
+                if MachineClientConfig.from_env() is not None:
+                    _logger.warning(
+                        "client-credentials: a machine client is configured, but no "
+                        "device-grant store was built (this deploy has no permission "
+                        "store), so /oauth/token is not mounted and the grant cannot "
+                        "answer. Configure a permission store."
+                    )
+            else:
+                handle_client_credentials = create_client_credentials_handler(
+                    auth_provider, permission_store
+                )
+
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only (the
-        # in-browser consent flow needs the accounts login page). Wires
-        # the full /oauth/* surface including the token endpoint. See
+        # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
+        # modes (both own a server-minted session cookie). Header mode has
+        # no server-mintable identity and is excluded. See
         # designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
+        _is_github_oidc = (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "oidc"
+            and auth_provider._oidc_config is not None
+            and getattr(auth_provider._oidc_config, "provider_type", None) == "github"
+        )
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and auth_provider._source in ("accounts", "oidc")
+            and not _is_github_oidc
             and device_grant_store is not None
         ):
             from omnigent.server.routes.device_auth import create_device_auth_router
 
             app.include_router(
-                create_device_auth_router(auth_provider, device_grant_store),
+                create_device_auth_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
@@ -2913,18 +4481,36 @@ def create_app(
             # No device flow, but login-issued refresh grants still need
             # their token/revoke endpoints — in OIDC mode and in accounts
             # mode without the flag alike.
+            if _is_github_oidc and env_var_is_truthy(
+                "OMNIGENT_DEVICE_GRANT_ENABLED", default=False
+            ):
+                _logger.warning(
+                    "device-grant: GitHub OAuth does not support prompt=login / "
+                    "max_age=0, so the anti-phishing re-auth gate cannot be enforced. "
+                    "Device-grant flow skipped for this deployment; only "
+                    "/oauth/token + /oauth/revoke are mounted."
+                )
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(
-                create_oauth_token_router(auth_provider, device_grant_store),
+                create_oauth_token_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
-    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
-    # registered AFTER all API routers so router routes win on overlap.
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount stays
+    # at the domain root regardless of `resolved_base_path` — a configured
+    # base path is instead handled by rebasing the served HTML/asset refs
+    # (see `_rewrite_web_ui_index`) and by `BasePathMiddleware` stripping the
+    # prefix from incoming requests, which is what lets one server work
+    # whether the fronting proxy forwards the prefix or strips it. The mount
+    # is registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
     # startup).
@@ -2950,7 +4536,7 @@ def create_app(
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
-                _SPAStaticFiles(directory=web_ui_dist, html=True),
+                _SPAStaticFiles(directory=web_ui_dist, html=True, base_path=resolved_base_path),
                 minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE,
             ),
             name="web-ui",
@@ -2966,6 +4552,15 @@ def create_app(
         async def root() -> FileResponse:
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
+
+    app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
+    app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
+    if resolved_base_path:
+        # Added last → outermost ASGI layer, so the prefix is stripped before
+        # routing and every other middleware sees canonical `/v1/...` paths.
+        # Only wired when a base path is configured: a root deployment pays
+        # no per-request cost.
+        app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     return app
 
@@ -2985,7 +4580,33 @@ class _SPAStaticFiles(StaticFiles):
     and a path with a file extension (``.js``, ``.css``, ``.png``,
     ``.woff2``, …) returns the static 404 verbatim. Other extensionless
     paths fall back to ``index.html``.
+
+    The HTML shell is rebased for the deployment ``base_path`` once at
+    startup (see :func:`_rewrite_web_ui_index`) and served from memory with
+    a content ``etag`` so ``If-None-Match`` revalidation still yields ``304``.
     """
+
+    def __init__(self, *args: Any, base_path: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._index_html: bytes | None = None
+        self._index_etag: str | None = None
+        index_file = Path(self.directory) / "index.html"  # type: ignore[arg-type]
+        if index_file.is_file():
+            html = _rewrite_web_ui_index(index_file.read_text(encoding="utf-8"), base_path)
+            self._index_html = html.encode("utf-8")
+            self._index_etag = f'"{hashlib.md5(self._index_html).hexdigest()}"'
+
+    def _shell_response(self, scope: Scope) -> Response:
+        """Serve the rebased HTML shell from memory, honoring ``If-None-Match``."""
+        assert self._index_html is not None
+        if_none_match = next(
+            (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"if-none-match"),
+            None,
+        )
+        if self._index_etag is not None and if_none_match == self._index_etag:
+            return Response(status_code=304, headers={"etag": self._index_etag})
+        headers = {"etag": self._index_etag} if self._index_etag else {}
+        return Response(self._index_html, media_type="text/html", headers=headers)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # The mount is at "/" so it catches *every* unmatched path —
@@ -3002,6 +4623,11 @@ class _SPAStaticFiles(StaticFiles):
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
+        # The HTML shell (root, directory, or SPA history fallback) is served
+        # from the rebased in-memory copy rather than the file on disk, so
+        # asset refs and the injected base-path global reflect `base_path`.
+        if self._index_html is not None and path in ("", ".", "index.html"):
+            return _apply_web_ui_cache_headers(self._shell_response(scope), "index.html")
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
@@ -3025,7 +4651,11 @@ class _SPAStaticFiles(StaticFiles):
                 )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
-                response = await super().get_response("index.html", scope)
+                response = (
+                    self._shell_response(scope)
+                    if self._index_html is not None
+                    else await super().get_response("index.html", scope)
+                )
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)

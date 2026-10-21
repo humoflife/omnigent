@@ -64,7 +64,7 @@ jobs:
       # Trusted default branch only (.github sparse). Never the PR head, so no
       # PR-authored code runs.
       - name: Check out .github
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github
@@ -120,7 +120,9 @@ jobs:
           python3 <<'PYEOF' || echo "::notice::Reviewer ranking failed; load-balanced fallback."
           import json, os, pathlib, re, urllib.request
 
-          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
+          config = json.loads(pathlib.Path(".github/areas.json").read_text())
+          paused = {u.casefold() for u in config.get("assignment_paused", [])}
+          areas = config["areas"]
           files = [f["path"] for f in
                    json.loads(pathlib.Path("/tmp/pr_files.json").read_text()).get("files", [])]
           if not files:
@@ -128,7 +130,8 @@ jobs:
 
           area_lines = [
               f"- {a['key']}: {a['definition']} "
-              f"Paths: {', '.join(a['paths'])}. Owners: {', '.join(a['owners'])}."
+              f"Paths: {', '.join(a['paths'])}. "
+              f"Owners: {', '.join(u for u in a['owners'] if u.casefold() not in paused)}."
               for a in areas
           ]
           system = (

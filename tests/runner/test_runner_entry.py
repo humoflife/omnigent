@@ -17,10 +17,14 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.native import native_terminal
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _apply_host_interactive_shells,
+    _host_interactive_shells_from_env,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
@@ -34,6 +38,7 @@ from omnigent.runner._entry import (
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
     _run_parent_death_killer,
+    _runner_last_activity,
     _runner_parent_pid_from_env,
     _runner_threadpool_max_workers,
     _runner_tunnel_binding_token_from_env,
@@ -43,10 +48,23 @@ from omnigent.runner._entry import (
     main,
 )
 from omnigent.runner.identity import (
+    RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.runner.transports.ws_tunnel.frames import (
+    EventAckFrame,
+    EventBatchFrame,
+    decode_frame,
+)
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+    RunnerTunnelAuthRejectedError,
+)
+from tests._helpers.session import bundle_files
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -54,6 +72,39 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 # here (via import_module, so there is no bound-but-unused import) resolves and
 # caches it with the real type.
 importlib.import_module("mcp.client.streamable_http")
+
+
+def test_host_interactive_shells_from_env_normalizes_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner wiring accepts only supported, ordered shell basenames."""
+    monkeypatch.setenv(
+        RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+        '["zsh", "bash", "zsh", "not-a-shell"]',
+    )
+    assert _host_interactive_shells_from_env() == ["zsh", "bash"]
+
+
+def test_apply_host_interactive_shells_only_replaces_native_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom agent terminals remain authored while native fallbacks change."""
+    from types import SimpleNamespace
+
+    from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["zsh", "bash"]')
+    native = SimpleNamespace(name=CLAUDE_NATIVE_AGENT_NAME, terminals={"bash": object()})
+    custom_terminal = object()
+    custom = SimpleNamespace(name="custom", terminals={"project": custom_terminal})
+
+    _apply_host_interactive_shells(native)
+    _apply_host_interactive_shells(custom)
+
+    assert list(native.terminals) == ["zsh", "bash"]
+    assert native.terminals["zsh"].command is not None
+    assert native.terminals["zsh"].command.endswith("zsh")
+    assert custom.terminals == {"project": custom_terminal}
 
 
 class _TrackingTerminalRegistry:
@@ -199,6 +250,47 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
     assert _make_auth_token_factory() is None
 
 
+def test_make_auth_token_factory_re_resolves_when_reused_sdk_auth_goes_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory replaces stale SDK auth before retrying a mint."""
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.stale = False
+
+        def authenticate(self) -> dict[str, str]:
+            if self.stale:
+                raise FileNotFoundError("baked CLI binary path was deleted")
+            return {"Authorization": f"Bearer {self.token}"}
+
+    cfgs: list[_Cfg] = []
+
+    def _resolve(profile: str | None = None) -> tuple[_DatabricksBearerAuth, str]:
+        cfgs.append(_Cfg(f"cli-token-{len(cfgs) + 1}"))
+        return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
+
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)  # skip OIDC branch
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _resolve,
+    )
+
+    factory = _make_auth_token_factory()
+    assert factory is not None
+    assert factory() == "cli-token-1"
+
+    cfgs[0].stale = True
+
+    assert factory() == "cli-token-2", (
+        "the factory kept the stale SDK auth instead of re-resolving, so a "
+        "live session stays fail-closed after a CLI upgrade"
+    )
+    assert len(cfgs) == 2
+
+
 def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -318,6 +410,29 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert mint_calls == []
 
 
+def test_initial_token_factory_reports_a_fallback_sign_in_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host bearer never waits on a sign-in; the fallback source behind it can."""
+
+    class _PendingFallback:
+        sign_in_pending = True
+
+        def __call__(self) -> str | None:
+            return None
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory", lambda *_a, **_k: _PendingFallback()
+    )
+    factory = _InitialAuthTokenFactory("host-bootstrap-token", "https://app.databricksapps.com")
+
+    assert factory() == "host-bootstrap-token"
+    assert factory.sign_in_pending is False
+    assert factory.invalidate() is True
+    assert factory() is None
+    assert factory.sign_in_pending is True
+
+
 def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -413,6 +528,134 @@ def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
     assert factory is not None
     assert factory() == "workspace-token"
     assert mint_calls == [1]
+
+
+def _refuse_mint(calls: list[str | None]) -> Any:
+    """Build a mint stand-in that records its proxy bearer and answers HTTP 400."""
+
+    def _mint(
+        mint_url: str, server_url: str, binding_token: str, *, proxy_bearer: str | None = None
+    ) -> tuple[str, float]:
+        del server_url, binding_token
+        calls.append(proxy_bearer)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "400", request=request, response=httpx.Response(400, request=request)
+        )
+
+    return _mint
+
+
+def test_delegated_refusal_is_not_reprobed_by_the_managed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that refused the delegated mint isn't asked again with the same token.
+
+    No-auth and header-mode servers answer the mint with a definitive 400. The
+    managed-sandbox fallback would resend the identical bare request.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    calls: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint(calls))
+
+    assert _make_auth_token_factory() is None
+    assert calls == [None]
+
+
+def test_managed_fallback_still_probes_after_a_proxy_bearer_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bare fallback is a different request when the delegated probe carried a bearer."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    calls: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint(calls))
+
+    factory = _make_auth_token_factory(_allow_initial_token=False, _proxy_bearer="host-bearer")
+
+    assert factory is None
+    assert calls == ["host-bearer", None]
+
+
+@pytest.mark.parametrize(("auth_resolved", "expected_resolutions"), [(True, 0), (False, 1)])
+def test_create_app_reuses_a_resolved_no_credential_result(
+    monkeypatch: pytest.MonkeyPatch, auth_resolved: bool, expected_resolutions: int
+) -> None:
+    """Boot hands its finished resolution to create_app, which must not redo it.
+
+    Re-resolving right after boot repeats the managed-mint probes and SDK
+    discovery for the same answer.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = Path("/tmp/omnigent-test/ap-test")
+
+    resolutions: list[int] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr("omnigent.terminals.TerminalRegistry", _TrackingTerminalRegistry)
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr(entry_mod.httpx, "Client", _TrackingSyncClient)
+    monkeypatch.setattr(
+        entry_mod, "_make_auth_token_factory", lambda: resolutions.append(1) or None
+    )
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    entry_mod.create_app(auth_token_factory=None, auth_resolved=auth_resolved)
+
+    assert len(resolutions) == expected_resolutions
+
+
+@pytest.mark.asyncio
+async def test_tunnel_boot_hands_its_auth_resolution_to_create_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot marks its credential resolution final, so create_app doesn't redo it."""
+    import omnigent.runner._entry as entry_mod
+
+    class _Stop(Exception):
+        """Ends the boot sequence once create_app is reached."""
+
+    seen: dict[str, object] = {}
+
+    def _capture_create_app(**kwargs: object) -> None:
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(entry_mod, "_runner_auth_factory", None)
+    monkeypatch.setattr(entry_mod, "_server_url_from_env", lambda: "http://runner.test")
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_tunnel_binding_token_from_env", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_parent_pid_from_env", lambda: None)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    monkeypatch.setattr(entry_mod, "create_app", _capture_create_app)
+
+    with pytest.raises(_Stop):
+        await entry_mod._run_tunnel_from_env()
+
+    assert seen == {"auth_token_factory": None, "auth_resolved": True}
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
@@ -545,9 +788,9 @@ def test_managed_mint_factory_installs_for_retry_on_transient_boot_failure(
     """A transient probe failure still installs the factory (armed to retry).
 
     If the mint endpoint has a blip at the instant the runner boots (network
-    error, 5xx), the factory must still install so a later callback re-mints
-    — otherwise the runner is left permanently unauthenticated until process
-    restart.
+    error, timeout), the factory must still install so a later callback
+    re-mints — otherwise the runner is left permanently unauthenticated until
+    process restart.
 
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
@@ -642,6 +885,342 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     sent2 = next(auth.auth_flow(request2))
     assert "Authorization" not in sent2.headers
     assert len(calls) == 2  # probe blip + the single definitive 400
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_managed_mint_factory_latches_declined_on_5xx_with_no_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    """A 5xx before any successful mint latches ``declined`` → bare requests.
+
+    An intermediary (e.g. a Databricks Apps relay answering 502 Bad Gateway)
+    can respond for the mint endpoint so the request never reaches the
+    server. With no cached token, treating that as transient means the
+    factory returns ``None`` forever and ``auth_flow`` raises on every
+    callback — bricking the session at spec resolve. The 5xx must latch
+    ``declined`` so callbacks fall back to bare requests.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param status_code: The 5xx status the intermediary answers with.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _bad_gateway(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint the way an intermediary's 5xx page does."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(status_code, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.proxy_auth_failed is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    sent = next(auth.auth_flow(request))  # must NOT raise (fail closed)
+    assert "Authorization" not in sent.headers
+
+    # The latch short-circuits: later calls never re-hit the endpoint.
+    assert factory() is None
+    assert len(calls) == 1
+
+
+def test_declined_latch_recovers_when_bare_request_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected bare request clears the 5xx decline and re-mints.
+
+    The decline latched by an intermediary 5xx is a guess that the server
+    doesn't need auth. When a bare callback then gets a re-auth signal
+    (401/403/OIDC redirect), the guess was wrong — the server was merely
+    down. The auth flow must clear the latch, mint a fresh token from the
+    recovered server, and retry the request authenticated, so the runner
+    heals without a process restart.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer 502 for the first mint (server down), then mint fine."""
+        calls.append(1)
+        if len(calls) == 1:
+            request = httpx.Request("POST", mint_url)
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return ("jwt-recovered", time.time() + 1800)
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # The authenticated server rejects the bare request → the flow clears
+    # the latch, re-mints, and retries with the fresh bearer.
+    retried = gen.send(httpx.Response(401))
+    assert retried.headers.get("Authorization") == "Bearer jwt-recovered"
+    assert factory.declined is False
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(200))
+
+
+def test_declined_latch_stays_bare_when_bare_request_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful bare request keeps the decline latched (no-auth server).
+
+    On a genuine no-auth/header-mode server, bare requests succeed; the
+    auth flow must not clear the latch or re-hit the mint endpoint on
+    every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _bad_gateway(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with 502."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _bad_gateway)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(200))
+    assert factory.declined is True
+    assert len(calls) == 1  # the latch kept later calls off the endpoint
+
+
+def test_managed_mint_factory_5xx_after_prior_mint_keeps_cached_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx after a successful mint is transient — serve the cache, no latch.
+
+    Once the server has proven it mints for this runner, a mid-session 5xx
+    (server restart, brief gateway hiccup) must not permanently flip the
+    factory to bare requests: the still-valid cached token is served and
+    the next refresh retries the mint.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _mint_then_5xx(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Mint a near-expiry token once, then answer 502 to refreshes."""
+        calls.append(1)
+        if len(calls) == 1:
+            # Within the refresh skew → the next call attempts a re-mint.
+            return ("jwt-1", time.time() + 250)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "bad gateway",
+            request=request,
+            response=httpx.Response(502, request=request),
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_then_5xx)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert factory is not None
+    assert isinstance(factory, _ManagedMintTokenFactory)
+
+    # Refresh attempt gets the 502; the still-valid cached token is served.
+    assert factory() == "jwt-1"
+    assert factory.declined is False
+    assert factory.proxy_auth_failed is False
+    assert len(calls) == 2
+
+
+def test_managed_mint_factory_probe_5xx_installs_declined_factory_that_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A construction-probe 5xx installs the factory with declined latched.
+
+    Callbacks then go out bare (non-blocking), and once the intermediary
+    stops answering for the server a rejected bare request can clear the
+    latch and re-mint — dropping the factory at boot would lose that
+    recovery path permanently.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer the probe with 502, then mint successfully."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return "jwt-recovered", time.time() + 3600
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _make_managed_mint_factory("https://s.example.com", "btok")
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory.declined is True
+    assert factory.declined_by_server_error is True
+    # Declined: calls return None without touching the network.
+    assert factory() is None
+    assert len(calls) == 1
+    # A rejected bare request clears the latch; the next call re-mints.
+    factory.reset_decline()
+    assert factory() == "jwt-recovered"
+    assert factory.declined is False
+
+
+def test_managed_mint_factory_snapshot_pairs_token_with_declined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """call_with_declined returns a consistent (token, declined) pair.
+
+    auth_flow decides raise-vs-bare from this snapshot; taking both values
+    under one lock acquisition means a concurrent decline-reset+mint can
+    never make a callback observe no-token alongside a stale declined=False
+    and raise spuriously.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _5xx_then_mint(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer the first mint with 502, then mint successfully."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        if len(calls) == 1:
+            raise httpx.HTTPStatusError(
+                "bad gateway",
+                request=request,
+                response=httpx.Response(502, request=request),
+            )
+        return "jwt-snap", time.time() + 3600
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _5xx_then_mint)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    # 5xx latches declined; the snapshot reports both halves consistently.
+    assert factory.call_with_declined() == (None, True)
+    factory.reset_decline()
+    assert factory.call_with_declined() == ("jwt-snap", False)
+
+
+def test_declined_latch_from_definitive_refusal_is_not_reset_on_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine 400/404 decline stays latched when a bare request is rejected.
+
+    Only a 5xx-latched decline (``declined_by_server_error``) is a guess
+    worth retracting. A no-auth/header-mode server that answered 400/404
+    definitively refused to mint; a later rejected bare request (e.g. an
+    unrelated 403) must not make ``auth_flow`` re-probe the mint endpoint
+    on every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _refuse(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Answer every mint with the definitive 400 of a no-auth server."""
+        calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "no auth provider", request=request, response=httpx.Response(400, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
+
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.declined_by_server_error is False
+
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    gen = auth.auth_flow(request)
+    bare = next(gen)
+    assert "Authorization" not in bare.headers
+
+    # A rejected bare request must NOT clear the definitive latch or re-mint.
+    with pytest.raises(StopIteration):
+        gen.send(httpx.Response(401))
+    assert factory.declined is True
+    assert len(calls) == 1
 
 
 def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
@@ -1600,6 +2179,113 @@ async def test_inactivity_monitor_honors_activity_reset() -> None:
     assert shutdowns == ["shutdown"]
 
 
+def test_runner_last_activity_picks_the_newest_clock() -> None:
+    """The combined reader returns the latest non-``None`` activity stamp.
+
+    :returns: None.
+    """
+    assert _runner_last_activity(10.0, None, None) == 10.0
+    assert _runner_last_activity(10.0, 12.5, None) == 12.5
+    assert _runner_last_activity(10.0, None, 30.0) == 30.0
+    assert _runner_last_activity(40.0, 12.5, 30.0) == 40.0
+
+
+@pytest.mark.asyncio
+async def test_inactivity_monitor_counts_forwarder_posts_as_activity() -> None:
+    """A native forwarder still posting holds off the idle shutdown.
+
+    Mirrors the mirrored-sub-agent scenario: the tunnel sees no server→runner
+    traffic, but the in-process forwarder keeps POSTing the child's items.
+    While posts land inside the idle window the monitor waits; one full idle
+    window after the last post it shuts the runner down.
+
+    :returns: None.
+    """
+    loop = asyncio.get_running_loop()
+    dispatcher = RunnerEventDispatcher()
+    tunnel_activity = loop.time()
+    native_forwarder_health.clear()
+    shutdowns: list[str] = []
+
+    def _last_activity() -> float:
+        return _runner_last_activity(
+            tunnel_activity,
+            dispatcher.last_dispatch_at,
+            native_forwarder_health.last_post_at(),
+        )
+
+    task = asyncio.create_task(
+        _run_inactivity_monitor(
+            idle_timeout_s=0.08,
+            get_last_activity=_last_activity,
+            has_active_work=lambda: False,
+            request_shutdown=lambda: shutdowns.append("shutdown"),
+            poll_interval_s=0.005,
+        )
+    )
+    try:
+        # Forwarder posts every ~20ms keep the runner alive past several windows.
+        for _ in range(8):
+            native_forwarder_health.note_post_success()
+            await asyncio.sleep(0.02)
+        assert shutdowns == []
+        assert not task.done()
+        # Once the child stops streaming, the next idle window exits the runner.
+        await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        native_forwarder_health.clear()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert shutdowns == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_inactivity_monitor_counts_dispatched_events_as_activity() -> None:
+    """A tunnel-acknowledged event batch also refreshes the activity clock.
+
+    :returns: None.
+    """
+    loop = asyncio.get_running_loop()
+    dispatcher = RunnerEventDispatcher()
+    tunnel_activity = loop.time() - 100.0
+    shutdowns: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    ack = await dispatcher.submit(
+        "session-a",
+        [
+            {
+                "type": "external_conversation_item",
+                "data": {"source_id": "record-1", "item_type": "message", "item_data": {}},
+            }
+        ],
+    )
+    assert ack.applied == 1
+
+    task = asyncio.create_task(
+        _run_inactivity_monitor(
+            idle_timeout_s=0.05,
+            get_last_activity=lambda: _runner_last_activity(
+                tunnel_activity, dispatcher.last_dispatch_at, None
+            ),
+            has_active_work=lambda: False,
+            request_shutdown=lambda: shutdowns.append("shutdown"),
+            poll_interval_s=0.005,
+        )
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.03)
+    assert shutdowns == []
+    await asyncio.wait_for(task, timeout=1.0)
+    assert shutdowns == ["shutdown"]
+
+
 def test_parent_process_is_alive_detects_current_process() -> None:
     """The liveness helper recognizes the current process id.
 
@@ -1787,6 +2473,40 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
     assert reasons == ["received SIGTERM"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_marks_shutting_down() -> None:
+    """A shutdown signal marks the runner shutting-down state before teardown.
+
+    ``_publish_terminal_exit`` reads this state to tell an intentional stop
+    (SIGTERM/SIGINT, whose teardown races the terminal watcher) from a real
+    terminal crash — it must be set as soon as the signal is handled, not
+    after any teardown. Delivers a real SIGTERM to this process.
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _install_signal_handlers
+
+    stop_event = asyncio.Event()
+    marked: list[bool] = []
+    _install_signal_handlers(
+        stop_event,
+        mark_shutting_down=lambda: marked.append(True),
+    )
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    assert marked == [True]
+
+
 def test_install_crash_logging_is_idempotent() -> None:
     """Installing the crash hook twice does not stack wrappers.
 
@@ -1807,9 +2527,15 @@ def test_install_crash_logging_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_owns_global_cleanup", "expected_sweep_orphans"),
+    [(True, False), (False, True)],
+)
 async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    host_owns_global_cleanup: bool,
+    expected_sweep_orphans: bool,
 ) -> None:
     """The --server local runner shuts down terminal-owned resources.
 
@@ -1819,7 +2545,6 @@ async def test_runner_shutdown_closes_terminal_registry(
     startup/shutdown hooks directly and verifies shutdown includes the
     TerminalRegistry, not just harness subprocesses and MCPs.
     """
-    import omnigent.inner.terminal as terminal_mod
     import omnigent.runner._entry as entry_mod
 
     process_managers: list[_FakeProcessManager] = []
@@ -1827,14 +2552,18 @@ async def test_runner_shutdown_closes_terminal_registry(
     mcp_managers: list[_TrackingMcpManager] = []
     async_clients: list[_TrackingAsyncClient] = []
     sync_clients: list[_TrackingSyncClient] = []
+    terminal_sweeps: list[int] = []
+    bridge_sweeps: list[int] = []
 
     class _FakeProcessManager:
         def __init__(self) -> None:
             self.started = False
             self.shutdown_called = False
+            self.instance_dir = Path("/tmp/omnigent-test/ap-test")
             process_managers.append(self)
 
-        async def start(self) -> None:
+        async def start(self, *, sweep_orphans: bool = True) -> None:
+            assert sweep_orphans is expected_sweep_orphans
             self.started = True
 
         async def shutdown(self) -> None:
@@ -1868,10 +2597,18 @@ async def test_runner_shutdown_closes_terminal_registry(
         return client
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
-    # create_app() performs its production orphan sweep during construction.
-    # Keep this lifecycle unit test away from terminals owned by other local
-    # runners and test sessions.
-    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    if host_owns_global_cleanup:
+        monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    else:
+        monkeypatch.delenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", raising=False)
+    monkeypatch.setattr(
+        "omnigent.inner.terminal.reap_orphaned_terminals",
+        lambda: terminal_sweeps.append(1) or 0,
+    )
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: bridge_sweeps.append(1) or 0,
+    )
     monkeypatch.setattr(
         "omnigent.runtime.harnesses.process_manager.HarnessProcessManager",
         _FakeProcessManager,
@@ -1893,7 +2630,10 @@ async def test_runner_shutdown_closes_terminal_registry(
     async with app.router.lifespan_context(app):
         pass
 
-    assert process_managers and process_managers[0].shutdown_called
+    assert process_managers and process_managers[0].started
+    assert process_managers[0].shutdown_called
+    assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
+    assert bridge_sweeps == ([] if host_owns_global_cleanup else [1])
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
@@ -1991,67 +2731,200 @@ async def test_resolve_agent_spec_from_server_returns_none_for_404(
     assert list(tmp_path.iterdir()) == []
 
 
+def _spec_bundle(name: str) -> bytes:
+    """Build a minimal agent bundle tarball named ``name``."""
+    config = f"spec_version: 1\nname: {name}\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config)
+        tf.addfile(info, io.BytesIO(config.encode()))
+    return buf.getvalue()
+
+
 @pytest.mark.asyncio
-async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
+async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     tmp_path: Path,
 ) -> None:
-    """A successful bundle fetch is cached under agent id and version.
+    """An unchanged bundle reuses its extracted directory; another bundle under the
+    same version (an agent removed and added again restarts at 1) gets its own.
 
     :param tmp_path: Temporary spec cache root.
     :returns: None.
     """
-    config_bytes = (
-        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
-    )
-    bundle_buf = io.BytesIO()
-    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config_bytes)
-        tf.addfile(info, io.BytesIO(config_bytes))
 
+    original = _spec_bundle("cached-agent")
+    served = [original, original, _spec_bundle("re-added")]
     requested_paths: list[str] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Return a valid bundle once, then invalid bytes for the cached version.
-
-        :param request: Incoming mocked HTTP request.
-        :returns: A mocked successful bundle response.
-        """
         requested_paths.append(request.url.path)
-        if len(requested_paths) == 1:
-            content = bundle_buf.getvalue()
-        else:
-            content = b"not a tarball"
-        return httpx.Response(
-            200,
-            content=content,
-            headers={"X-Agent-Version": "7"},
-        )
+        return httpx.Response(200, content=served.pop(0), headers={"X-Agent-Version": "1"})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        first = await _resolve_agent_spec_from_server(
+        resolved = [
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_cached", session_id="conv_test"
+            )
+            for _ in range(3)
+        ]
+
+    assert [spec.name for spec in resolved if spec is not None] == [
+        "cached-agent",
+        "cached-agent",
+        "re-added",
+    ]
+    assert requested_paths == ["/v1/sessions/conv_test/agent/contents"] * 3
+    assert resolved[0] is not None and resolved[1] is not None
+    assert resolved[0].workdir == resolved[1].workdir
+    assert sorted(path.name.startswith("ag_cached-v1-") for path in tmp_path.iterdir()) == [
+        True,
+        True,
+    ]
+
+
+async def test_resolve_agent_spec_rebuilds_cache_after_config_is_removed(tmp_path: Path) -> None:
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                b"spec_version: 1\nname: cached-agent\n"
+                b"executor:\n  config:\n    harness: claude-sdk\n"
+            )
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        original = await _resolve_agent_spec_from_server(
             client, tmp_path, "ag_cached", session_id="conv_test"
         )
-        second = await _resolve_agent_spec_from_server(
+        assert original is not None
+        (original.workdir / "config.yaml").unlink()
+        (original.workdir / "partial.txt").write_text("left behind by an interrupted extraction")
+
+        repaired = await _resolve_agent_spec_from_server(
             client, tmp_path, "ag_cached", session_id="conv_test"
         )
 
-    assert first is not None
-    assert second is not None
-    assert first.name == "cached-agent"
-    assert second.name == "cached-agent"
-    assert requested_paths == [
-        "/v1/sessions/conv_test/agent/contents",
-        "/v1/sessions/conv_test/agent/contents",
+    assert repaired is not None
+    assert repaired.spec.name == "cached-agent"
+    assert repaired.workdir == original.workdir
+    assert (repaired.workdir / "config.yaml").is_file()
+    assert not (repaired.workdir / "partial.txt").exists()
+    assert list(tmp_path.iterdir()) == [repaired.workdir]
+
+
+async def test_resolve_agent_spec_does_not_publish_interrupted_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                b"spec_version: 1\nname: cached-agent\n"
+                b"executor:\n  config:\n    harness: claude-sdk\n"
+            )
+        }
+    )
+
+    def interrupted_extract(_source: object, dest: Path, **_kwargs: object) -> None:
+        (dest / "partial.txt").write_text("incomplete bundle")
+        raise OSError("interrupted extraction")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        with monkeypatch.context() as patch:
+            patch.setattr("omnigent.spec.extract_safe", interrupted_extract)
+            with pytest.raises(OSError, match="interrupted extraction"):
+                await _resolve_agent_spec_from_server(
+                    client, tmp_path, "ag_cached", session_id="conv_test"
+                )
+        assert list(tmp_path.iterdir()) == []
+
+        repaired = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_cached", session_id="conv_test"
+        )
+
+    assert repaired is not None
+    assert repaired.spec.name == "cached-agent"
+    assert list(tmp_path.iterdir()) == [repaired.workdir]
+    assert not (repaired.workdir / "partial.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_retries_a_throttled_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited fetch is retried inside the server's init timeout, not failed.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Pytest patch fixture for the retry sleep.
+    :returns: None.
+    """
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "30"}),
+        httpx.Response(429),
+        httpx.Response(200, content=_spec_bundle("throttled-agent")),
     ]
-    cache_dir = tmp_path / "ag_cached-v7"
-    assert cache_dir.is_dir()
-    assert (cache_dir / "config.yaml").read_text() == config_bytes.decode()
-    assert [path.name for path in tmp_path.iterdir()] == ["ag_cached-v7"]
+    sleeps: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(native_terminal, "_sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: responses.pop(0)),
+        base_url="http://server.test",
+    ) as client:
+        spec = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_throttled", session_id="conv_test"
+        )
+
+    assert spec is not None and spec.name == "throttled-agent"
+    # The 30s hint is capped so the retries fit the server's 10s init wait.
+    assert sleeps == [2.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_raises_when_throttling_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fetch still throttled after the retries fails as before, naming the 429.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Pytest patch fixture for the retry sleep.
+    :returns: None.
+    """
+    attempts = 0
+    sleeps: list[float] = []
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(429)
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(native_terminal, "_sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(RuntimeError, match="HTTP 429"):
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_throttled", session_id="conv_test"
+            )
+
+    assert attempts == 4
+    assert sleeps == [0.5, 1.0, 2.0]
 
 
 @pytest.mark.asyncio
@@ -2092,42 +2965,55 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     assert "/v1/sessions/conv_test/agent/contents" in message
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX],
+    ids=["rejected-by-server", "no-credential"],
+)
+@pytest.mark.parametrize(
+    ("error_type", "exit_code"),
+    [(RuntimeError, 1), (RunnerTunnelAuthRejectedError, RUNNER_AUTH_REJECTED_EXIT_CODE)],
+)
 def test_main_reports_tunnel_rejection_without_traceback(
+    prefix: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    error_type: type[RuntimeError],
+    exit_code: int,
 ) -> None:
-    """Fatal tunnel rejections are rendered as concise CLI errors.
+    """Fatal tunnel auth failures are rendered as concise CLI errors.
 
+    A refused credential exits with its own code so the host can report it.
+
+    :param prefix: Fatal-class message prefix emitted by ``serve_tunnel``.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param capsys: Pytest stdout/stderr capture fixture.
+    :param error_type: Fatal rejection type ``serve_tunnel`` raises.
+    :param exit_code: Expected process exit code.
     :returns: None.
     """
 
-    async def _raise_tunnel_rejection() -> None:
+    async def _raise_tunnel_failure() -> None:
         """Raise the RuntimeError shape emitted by ``serve_tunnel``.
 
         :returns: None.
-        :raises RuntimeError: Always, matching fatal server rejection.
+        :raises RuntimeError: Always, matching a fatal tunnel auth failure.
         """
-        raise RuntimeError(
-            f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401); check remote server authentication"
-        )
+        raise error_type(f"{prefix}(HTTP 401); check remote server authentication")
 
     monkeypatch.setattr(
         "omnigent.runner._entry._run_tunnel_from_env",
-        _raise_tunnel_rejection,
+        _raise_tunnel_failure,
     )
 
     with pytest.raises(SystemExit) as exc_info:
         main()
 
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == exit_code
     stderr = capsys.readouterr().err
-    # The CLI should expose the actionable rejection message without
-    # dumping the asyncio/serve_tunnel traceback onto stderr.
-    assert stderr == (
-        f"error: {RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401); check remote server authentication\n"
-    )
+    # The CLI should expose the actionable message without dumping the
+    # asyncio/serve_tunnel traceback onto stderr.
+    assert stderr == f"error: {prefix}(HTTP 401); check remote server authentication\n"
     assert "Traceback" not in stderr
 
 
@@ -2175,23 +3061,14 @@ def test_main_configures_runner_process_logging(
     assert captured == {"destination": "runner", "force": True}
 
 
-def test_main_makes_the_workspace_importable(
+def test_main_preserves_runtime_import_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """``main`` puts the workspace back on ``sys.path`` for local tools.
-
-    The runner is spawned with ``-P`` so its workspace cannot shadow the
-    installed omnigent. Spec-declared local tools are still imported by dotted
-    path, so the workspace has to be restored once omnigent itself is imported.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Stands in for the session workspace.
-    :returns: None.
-    """
+    """Local callable packages must be installed outside the session workspace."""
 
     async def _stop_immediately() -> None:
-        """Let ``main`` return once the path is set up.
+        """Let ``main`` return without starting a tunnel.
 
         :returns: None.
         """
@@ -2203,9 +3080,12 @@ def test_main_makes_the_workspace_importable(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "path", [p for p in sys.path if p != str(tmp_path)])
 
+    runtime_path = list(sys.path)
+
     main()
 
-    assert str(tmp_path) in sys.path
+    assert sys.path == runtime_path
+    assert str(tmp_path) not in sys.path
 
 
 def test_main_preserves_unexpected_runtime_errors(
@@ -2447,3 +3327,64 @@ def test_auth_token_factory_refreshes_expired_oidc_token(
     assert factory is not None
     assert factory() == "refreshed-jwt"
     assert refresh_calls, "the refresh path must have run"
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+def test_runner_global_cleanup_ownership_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: bool,
+) -> None:
+    """Only host-launched runners delegate machine-global cleanup."""
+    from omnigent.runner._entry import _runner_host_owns_global_cleanup_from_env
+    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
+
+    if raw_value is None:
+        monkeypatch.delenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raw_value)
+
+    assert _runner_host_owns_global_cleanup_from_env() is expected
+
+
+@pytest.mark.asyncio
+async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
+    import json
+
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("selected-agent")
+    labels = [{MCP_SELECTION_PREFIX + "tracker": "1"}, {MCP_SELECTION_PREFIX + "tracker": "0"}, {}]
+
+    def handler(request):
+        assert request.headers[MCP_SELECTION_HEADER] == "1"
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                MCP_SELECTION_HEADER: json.dumps(labels.pop(0)),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_selected", session_id="session"
+            )
+            for _ in range(3)
+        ]
+    assert [[s.name for s in result.spec.mcp_servers] for result in results] == [
+        ["tracker"],
+        [],
+        [],
+    ]
+    assert len({result.workdir for result in results}) == 1
+    assert "registry" not in (results[0].workdir / "config.yaml").read_text()

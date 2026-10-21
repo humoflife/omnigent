@@ -33,6 +33,12 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 
+# Wall-clock ceiling for polling the recording dispatch. The notifier
+# hops through ``run_coroutine_threadsafe`` and an escalation sleep, so
+# on a loaded 8-worker xdist runner a 1s budget times out spuriously; a
+# passing test returns as soon as the dispatch lands regardless.
+_WAIT_TIMEOUT_S = 10.0
+
 
 async def _instant_sleep(_seconds: float) -> None:
     """
@@ -64,7 +70,7 @@ def elicitation_armed(notifier: SubagentBlockNotifier, elicitation_id: str) -> b
         ``False``.
     """
     with notifier._lock:
-        return elicitation_id in notifier._notified
+        return any(key[1] == elicitation_id for key in notifier._notified)
 
 
 # Per-test @pytest.mark.asyncio rather than a module marker: the pure
@@ -227,7 +233,7 @@ def _resolved_event(elicitation_id: str, action: str | None = None) -> dict[str,
 
 
 async def _wait_for_calls(
-    dispatch: _RecordingDispatch, expected: int, timeout_s: float = 1.0
+    dispatch: _RecordingDispatch, expected: int, timeout_s: float = _WAIT_TIMEOUT_S
 ) -> None:
     """
     Spin until ``dispatch.calls`` has at least ``expected`` entries.
@@ -240,7 +246,7 @@ async def _wait_for_calls(
     :param dispatch: Recording dispatch to poll.
     :param expected: Minimum number of calls to wait for.
     :param timeout_s: Hard ceiling so a stuck test fails loudly rather
-        than hanging forever, e.g. ``1.0``.
+        than hanging forever; defaults to ``_WAIT_TIMEOUT_S``.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
     while len(dispatch.calls) < expected:
@@ -365,22 +371,92 @@ async def test_observe_re_arms_after_resolved_event(
     notifier.observe(child.id, _request_event("elicit_one"))
     await _wait_for_calls(dispatch, expected=1)
     notifier.observe(child.id, _resolved_event("elicit_one"))
-    # The arm drops synchronously in observe, so the re-block below
-    # re-fires; the resolve also signals the first handler to send its
-    # resolution notice.
+    # A re-block supersedes the old resolution before its notice is delivered.
     notifier.observe(child.id, _request_event("elicit_one"))
-    await _wait_for_calls(dispatch, expected=3)
+    await _wait_for_calls(dispatch, expected=2)
+    assert all("blocked awaiting human approval" in call.notice for call in dispatch.calls)
 
-    # 3 = block wake + resolution notice for it + re-block wake. 2 would
-    # mean the resolution notice was dropped; 1 would mean the
-    # resolved-event branch missed and the re-block was debounced away.
-    # The notice/wake order after the resolve is scheduling-dependent,
-    # so assert by kind rather than position.
-    assert len(dispatch.calls) == 3
-    block_notices = [c for c in dispatch.calls if "blocked awaiting human approval" in c.notice]
-    resolution_notices = [c for c in dispatch.calls if "has been resolved" in c.notice]
-    assert len(block_notices) == 2
-    assert len(resolution_notices) == 1
+    notifier.observe(child.id, _resolved_event("elicit_one", "decline"))
+    await _wait_for_calls(dispatch, expected=3)
+    assert "action: decline" in dispatch.calls[-1].notice
+    assert not elicitation_armed(notifier, "elicit_one")
+    notifier.close()
+
+
+@pytest.mark.asyncio
+async def test_resolution_requires_the_arming_conversation(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        notifier.observe(child.id, _request_event("elicit_one"))
+        await _wait_for_calls(dispatch, expected=1)
+
+        notifier.observe(parent.id, _resolved_event("elicit_one", "accept"))
+        assert elicitation_armed(notifier, "elicit_one")
+        assert not notifier._resolution_signals[(child.id, "elicit_one")].is_set()
+
+        notifier.observe(child.id, _resolved_event("elicit_one", "decline"))
+        await _wait_for_calls(dispatch, expected=2)
+        assert not elicitation_armed(notifier, "elicit_one")
+        assert "action: decline" in dispatch.calls[-1].notice
+        assert dispatch.calls[-1].parent_id == parent.id
+    finally:
+        notifier.close()
+
+
+@pytest.mark.asyncio
+async def test_resolution_without_an_armed_request_is_ignored(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_running_loop(),
+    )
+    notifier.observe("conversation", _resolved_event("elicit_unarmed", "accept"))
+    assert not elicitation_armed(notifier, "elicit_unarmed")
+    assert dispatch.calls == []
+
+
+@pytest.mark.asyncio
+async def test_equal_elicitation_ids_keep_independent_parent_notifications(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    parents = [conv_store.create_conversation(title=title) for title in ("first", "second")]
+    children = [
+        conv_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+        for parent in parents
+    ]
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(conv_store, dispatch, asyncio.get_running_loop())
+    try:
+        for child in children:
+            notifier.observe(child.id, _request_event("shared_id"))
+        await _wait_for_calls(dispatch, expected=2)
+        assert {call.parent_id for call in dispatch.calls} == {parent.id for parent in parents}
+
+        notifier.observe(children[0].id, _resolved_event("shared_id", "decline"))
+        await _wait_for_calls(dispatch, expected=3)
+        assert dispatch.calls[-1].parent_id == parents[0].id
+        assert "action: decline" in dispatch.calls[-1].notice
+        assert elicitation_armed(notifier, "shared_id")
+
+        notifier.observe(children[1].id, _resolved_event("shared_id", "accept"))
+        await _wait_for_calls(dispatch, expected=4)
+        assert dispatch.calls[-1].parent_id == parents[1].id
+        assert "action: accept" in dispatch.calls[-1].notice
+        assert not elicitation_armed(notifier, "shared_id")
+    finally:
+        notifier.close()
 
 
 class _GatedEscalation:
@@ -447,7 +523,7 @@ async def test_resolve_during_escalation_grace_suppresses_wake(
 
     notifier.observe(child.id, _request_event("elicit_attended"))
     # Wait until the handler is parked in the grace, then resolve.
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while gate.entered < 1:
         assert asyncio.get_event_loop().time() < deadline, "handler never reached the grace"
         await asyncio.sleep(0)
@@ -490,7 +566,7 @@ async def test_wake_fires_only_after_escalation_grace(
     )
 
     notifier.observe(child.id, _request_event("elicit_idle", message="Run rm -rf?"))
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while gate.entered < 1:
         assert asyncio.get_event_loop().time() < deadline, "handler never reached the grace"
         await asyncio.sleep(0)
@@ -711,7 +787,7 @@ async def test_resolve_racing_inflight_wake_still_sends_resolution_notice(
     dispatch.elicitation_id = "elicit_midflight"
 
     notifier.observe(child.id, _request_event("elicit_midflight"))
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while len(dispatch.calls) < 2:
         assert asyncio.get_event_loop().time() < deadline, (
             f"expected the resolution notice to follow the raced block wake; "
@@ -753,7 +829,7 @@ async def test_no_resolution_notice_after_failed_wake(
     notifier.observe(child.id, _request_event("elicit_fail"))
     # 3 = 1 attempt + 2 retries, all raising; then the arm is released.
     await _wait_for_calls(dispatch, expected=3)
-    deadline = asyncio.get_event_loop().time() + 1.0
+    deadline = asyncio.get_event_loop().time() + _WAIT_TIMEOUT_S
     while elicitation_armed(notifier, "elicit_fail"):
         assert asyncio.get_event_loop().time() < deadline, "arm never released after failure"
         await asyncio.sleep(0)

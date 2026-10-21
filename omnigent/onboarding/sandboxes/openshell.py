@@ -27,9 +27,8 @@ Notes that shape this launcher:
   protobufs, so the spec is built from the generated ``openshell._proto``
   module — the only path to a non-default image.
 - **No file-transfer RPC.** OpenShell exposes command execution but no
-  upload primitive, so :meth:`put` streams the file's bytes to ``cat``
-  over the exec channel's stdin — the same approach NVIDIA's own
-  LangChain backend uses.
+  upload primitive, so :meth:`put` sends a snapshot of the file to ``cat``
+  in bounded exec stdin chunks to stay under the gateway's message cap.
 - **No local port forwarding.** OpenShell has no local→sandbox port
   forward for the in-sandbox App OAuth callback, so the CLI skips that
   auth step automatically (``supports_local_port_forward = False``).
@@ -41,14 +40,16 @@ import logging
 import os
 import shlex
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar, cast
 
 import click
 
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
+    SandboxGoneError,
     SandboxLauncher,
     foreground_kill_command,
     foreground_pidfile,
@@ -84,6 +85,10 @@ operations (create, get, delete, wait_ready). Defaults to ``"default"``."""
 
 _DEFAULT_WORKSPACE: str = "default"
 
+# Upload chunk size. The gateway rejects a gRPC message whose decoded size
+# exceeds 1 MiB; stay well under it to leave room for framing overhead.
+_PUT_CHUNK_BYTES = 512 * 1024
+
 _READY_TIMEOUT_S = 300
 _EXEC_TIMEOUT_S = 300
 # A foreground host (`omnigent host`) is held open until Ctrl-C, so its
@@ -104,6 +109,20 @@ _FOREGROUND_TIMEOUT_S = 7 * 24 * 3600
 _SANDBOX_HOME = "/sandbox"
 
 _T = TypeVar("_T")
+
+
+def _sdk_supports_resume() -> bool:
+    """Whether the installed openshell SDK can drive an in-place resume.
+
+    The gateway's resume primitive is ``SandboxClient.start`` (available
+    from openshell 0.0.105). Returns ``False`` when the SDK is missing or
+    predates it, so callers never advertise a wake they cannot perform.
+    """
+    try:
+        from openshell import SandboxClient
+    except ImportError:
+        return False
+    return callable(getattr(SandboxClient, "start", None))
 
 
 def _ensure_sdk() -> None:
@@ -133,7 +152,13 @@ class _OpenShellClient:
             cli_bootstrap=True,
             managed_launch=True,
             local_port_forward=False,
-            resume_stopped=False,
+            # Only an SDK exposing the resume primitive can wake a stopped
+            # sandbox; advertising it on an older SDK would promise a wake
+            # that always fails.
+            resume_stopped=_sdk_supports_resume(),
+            # Flips once the gateway's agent-sandbox backend exposes its
+            # suspend+snapshot restore through the SDK.
+            snapshot_restore=False,
             programmatic_terminate=True,
             file_copy=True,
             streaming_exec=False,
@@ -152,8 +177,6 @@ class _OpenShellClient:
                 "`openshell gateway select <name>` (or set OPENSHELL_GATEWAY)."
             ) from exc
         self._workspace = workspace
-        # Petname (public handle) -> opaque sandbox id, which exec needs.
-        self._ids: dict[str, str] = {}
         # Daemon threads holding long-lived exec streams open (see
         # exec_background): OpenShell kills an exec's processes when the
         # ExecSandbox RPC returns, so a backgrounded host must be kept on
@@ -184,7 +207,6 @@ class _OpenShellClient:
             ),
         )
         sandbox_name: str = ready.name
-        self._ids[sandbox_name] = ready.id
         return sandbox_name
 
     def execute(
@@ -196,12 +218,13 @@ class _OpenShellClient:
         timeout: int = _EXEC_TIMEOUT_S,
     ) -> ExecResult:
         """Run *command* (argv) in the sandbox and return its ExecResult."""
-        sandbox_id = self._id_for(name)
+        ws = self._workspace
         return self._guard(
             f"Remote command failed on OpenShell sandbox '{name}'",
             lambda: self._client.exec(
-                sandbox_id,
+                name,
                 command,
+                workspace=ws,
                 stdin=stdin,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
@@ -214,12 +237,12 @@ class _OpenShellClient:
         import grpc
         from openshell import ExecChunk, ExecResult, SandboxError
 
-        sandbox_id = self._id_for(name)
         exit_code = 0
         try:
             for item in self._client.exec_stream(
-                sandbox_id,
+                name,
                 command,
+                workspace=self._workspace,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
                 env={"HOME": _SANDBOX_HOME},
@@ -252,13 +275,14 @@ class _OpenShellClient:
         """
         import threading
 
-        sandbox_id = self._id_for(name)
+        ws = self._workspace
 
         def _pump() -> None:
             try:
                 for _ in self._client.exec_stream(
-                    sandbox_id,
+                    name,
                     command,
+                    workspace=ws,
                     timeout_seconds=timeout,
                     workdir=_SANDBOX_HOME,
                     env={"HOME": _SANDBOX_HOME},
@@ -276,14 +300,42 @@ class _OpenShellClient:
         thread.start()
         self._bg_threads.append(thread)
 
-    def get_status(self, name: str) -> None:
-        """Resolve a sandbox by name (validates access) and cache its id."""
+    def resume_sandbox(self, name: str) -> None:
+        """Resume a stopped sandbox in place and wait until it is ready again.
+
+        The gateway delegates the actual restart to its compute driver; the
+        sandbox keeps its name and persistent volume. The SDK names this
+        primitive ``SandboxClient.start`` (available from openshell 0.0.105);
+        an SDK predating it gets an actionable error — the server's wake path
+        surfaces it without tearing the sandbox down.
+        """
+        start = getattr(self._client, "start", None)
+        if start is None:
+            raise click.ClickException(
+                f"Could not resume OpenShell sandbox '{name}': the installed "
+                "openshell SDK exposes no sandbox resume primitive "
+                "(SandboxClient.start; requires openshell>=0.0.105). Upgrade the "
+                "openshell package (`uv pip install --upgrade 'omnigent[openshell]'`)."
+            )
         ws = self._workspace
-        ref = self._guard(
+        self._guard(
+            f"Could not resume OpenShell sandbox '{name}'",
+            lambda: start(name, workspace=ws),
+            gone_on_not_found=True,
+        )
+        self._guard(
+            f"OpenShell sandbox '{name}' did not become ready after resume",
+            lambda: self._client.wait_ready(name, workspace=ws, timeout_seconds=_READY_TIMEOUT_S),
+            gone_on_not_found=True,
+        )
+
+    def get_status(self, name: str) -> None:
+        """Resolve a sandbox by name, which validates access to it."""
+        ws = self._workspace
+        self._guard(
             f"Could not resolve OpenShell sandbox '{name}'",
             lambda: self._client.get(name, workspace=ws),
         )
-        self._ids[name] = ref.id
 
     def delete_sandbox(self, name: str) -> None:
         """Delete a sandbox; a missing sandbox is treated as already gone."""
@@ -294,33 +346,24 @@ class _OpenShellClient:
             self._client.delete(name, workspace=self._workspace)
         except grpc.RpcError as exc:
             if isinstance(exc, grpc.Call) and exc.code() == grpc.StatusCode.NOT_FOUND:
-                self._ids.pop(name, None)
                 return
             raise click.ClickException(
                 f"Failed to delete OpenShell sandbox '{name}': {exc}"
             ) from exc
         except SandboxError as exc:
             if "not found" in str(exc).lower():
-                self._ids.pop(name, None)
                 return
             raise click.ClickException(
                 f"Failed to delete OpenShell sandbox '{name}': {exc}"
             ) from exc
-        self._ids.pop(name, None)
 
-    def _id_for(self, name: str) -> str:
-        cached = self._ids.get(name)
-        if cached is None:
-            ws = self._workspace
-            ref = self._guard(
-                f"Could not resolve OpenShell sandbox '{name}'",
-                lambda: self._client.get(name, workspace=ws),
-            )
-            cached = ref.id
-            self._ids[name] = cached
-        return cached
-
-    def _guard(self, message: str, call: Callable[[], _T]) -> _T:
+    def _guard(
+        self,
+        message: str,
+        call: Callable[[], _T],
+        *,
+        gone_on_not_found: bool = False,
+    ) -> _T:
         """Run an SDK *call*, surfacing gRPC / SandboxError as ClickException."""
         import grpc
         from openshell import SandboxError
@@ -328,6 +371,13 @@ class _OpenShellClient:
         try:
             return call()
         except (grpc.RpcError, SandboxError) as exc:
+            not_found = (
+                isinstance(exc, grpc.Call) and exc.code() == grpc.StatusCode.NOT_FOUND
+            ) or (isinstance(exc, SandboxError) and "not found" in str(exc).lower())
+            if gone_on_not_found and not_found:
+                raise SandboxGoneError(f"{message}: sandbox no longer exists") from cast(
+                    BaseException, exc
+                )
             raise click.ClickException(f"{message}: {exc}") from exc
 
 
@@ -342,6 +392,20 @@ class OpenShellSandboxLauncher(SandboxLauncher):
 
     provider: ClassVar[str] = "openshell"
     supports_local_port_forward: ClassVar[bool] = False
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        """Feature flags, with in-place resume gated on the installed SDK.
+
+        The gateway's compute backend keeps a stopped sandbox and its
+        volume, so a dormant managed host is woken in place via
+        :meth:`resume` — but only an SDK exposing the resume primitive
+        (``SandboxClient.start``, openshell>=0.0.105) can drive the wake.
+        Advertising ``resume_stopped`` on an older SDK would render dormant
+        hosts as wakeable while every wake fails, so those installs keep
+        the honest ``host_offline`` state instead.
+        """
+        return replace(super().capabilities, resume_stopped=_sdk_supports_resume())
 
     def __init__(
         self,
@@ -436,20 +500,29 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
-        """Copy a local file into the sandbox by piping its bytes to ``cat``."""
+        """Copy a local file into the sandbox by piping its bytes to ``cat``.
+
+        Snapshot before sending: another bootstrap may rebuild the source.
+        Each exec's stdin is one gRPC message, capped at 1 MiB by the gateway.
+        The first chunk truncates the destination; later chunks append. Empty
+        files still make one request, and retrying the whole upload starts clean.
+        """
         content = local_path.read_bytes()
         parent = shlex.quote(str(PurePosixPath(remote_path).parent))
         dest = shlex.quote(remote_path)
-        result = self._openshell().execute(
-            sandbox_id,
-            ["bash", "-c", f"mkdir -p {parent} && cat > {dest}"],
-            stdin=content,
-        )
-        if result.exit_code != 0:
-            raise click.ClickException(
-                f"File upload to OpenShell sandbox '{sandbox_id}' failed "
-                f"(exit {result.exit_code}): {result.stderr.strip()}"
+        client = self._openshell()
+        for offset in range(0, max(len(content), 1), _PUT_CHUNK_BYTES):
+            redirect = ">" if offset == 0 else ">>"
+            result = client.execute(
+                sandbox_id,
+                ["bash", "-c", f"mkdir -p {parent} && cat {redirect} {dest}"],
+                stdin=content[offset : offset + _PUT_CHUNK_BYTES],
             )
+            if result.exit_code != 0:
+                raise click.ClickException(
+                    f"File upload to OpenShell sandbox '{sandbox_id}' failed "
+                    f"(exit {result.exit_code}): {result.stderr.strip()}"
+                )
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """
@@ -490,6 +563,12 @@ class OpenShellSandboxLauncher(SandboxLauncher):
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """Overlay shipped wheels onto the prebaked host image."""
         return host_image_wheel_install_command(remote_tgz_path)
+
+    def resume(self, sandbox_id: str) -> None:
+        """Resume a stopped OpenShell sandbox in place, keeping name + volume."""
+        click.echo(f"▸ Resuming OpenShell sandbox '{sandbox_id}'")
+        self._openshell().resume_sandbox(sandbox_id)
+        click.echo(f"  → resumed {sandbox_id}")
 
     def terminate(self, sandbox_id: str) -> None:
         """Delete a sandbox, releasing its compute."""

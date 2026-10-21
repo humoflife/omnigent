@@ -12,10 +12,13 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.db.account_authority import target_account_scope
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -162,24 +165,32 @@ def register_permissions_routes(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-            if body.level > LEVEL_READ:
+            from omnigent.server.sharing_settings import PublicSharingMaxLevel
+
+            ceiling = getattr(
+                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
+            )()
+            if body.level > ceiling.level:
                 raise OmnigentError(
-                    "Public access is limited to read-only (level 1)",
+                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
-        if existing is not None and existing.level == LEVEL_OWNER:
-            raise OmnigentError(
-                "Cannot modify owner permissions",
-                code=ErrorCode.FORBIDDEN,
+        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
+        with target_account_scope(body.user_id, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                raise OmnigentError(
+                    "Cannot modify owner permissions",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
+            perm = await asyncio.to_thread(
+                permission_store.grant, body.user_id, session_id, body.level
             )
-        await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-        perm = await asyncio.to_thread(
-            permission_store.grant, body.user_id, session_id, body.level
-        )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
+        add_audit_attrs(target_user_id=body.user_id, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -274,6 +285,7 @@ def register_permissions_routes(
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
+        add_audit_attrs(target_user_id=target_user_id, left_self=leaving_self)
         return Response(status_code=204)
 
     @router.get(
@@ -368,7 +380,15 @@ def _policy_description(spec: PolicySpec) -> str | None:
     return None
 
 
-def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+def _to_agent_object(
+    agent: Agent,
+    cache: AgentCache | None,
+    *,
+    mcp_servers_editable: bool,
+    terminals_override: list[str] | None = None,
+    mcp_selection: dict[str, str] | None = None,
+    mcp_registry_editable: bool = False,
+) -> AgentObject:
     """
     Convert a runtime :class:`Agent` entity to an API-layer
     :class:`AgentObject`.
@@ -382,6 +402,12 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
 
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
+    :param terminals_override: Selected host's shell inventory. Applied only
+        when the loaded spec is a recognized native wrapper.
+    :param mcp_selection: Session MCP selection labels, when called for a session.
+    :param mcp_registry_editable: Whether the caller can change session MCP selections.
+    :param mcp_servers_editable: Whether the authenticated caller may mutate
+        MCP configuration for the session serving this object.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -399,19 +425,27 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
             # gates its "new terminal" affordance on this list.
-            terminals = list(loaded.spec.terminals or {})
-            # Bundled skills only (mirrors GET /v1/agents); the merged
-            # bundled + host-discovered set lives on the session snapshot.
+            terminals = (
+                list(terminals_override)
+                if terminals_override is not None
+                and native_coding_agent_for_agent_name(loaded.spec.name) is not None
+                else list(loaded.spec.terminals or {})
+            )
+            # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
+                for s in loaded.spec.skills
+                if s.user_invocable
             ]
+            from omnigent.mcp_selection import selected_mcp_spec
+
             mcp_servers = [
                 MCPServerSummary(
                     name=srv.name,
@@ -422,7 +456,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
                     command=srv.command,
                     args=srv.args,
                 )
-                for srv in loaded.spec.mcp_servers
+                for srv in selected_mcp_spec(loaded.spec, mcp_selection or {}).mcp_servers
             ]
             if loaded.spec.guardrails and loaded.spec.guardrails.policies:
                 policies = [
@@ -454,8 +488,11 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         updated_at=agent.updated_at,
         harness=harness,
         mcp_servers=mcp_servers,
+        mcp_registry_editable=mcp_registry_editable,
         mcp_servers_editable=(
-            agent.session_id is not None and not (harness or "").endswith("-native")
+            mcp_servers_editable
+            and agent.session_id is not None
+            and not (harness or "").endswith("-native")
         ),
         policies=policies,
         skills=skills,

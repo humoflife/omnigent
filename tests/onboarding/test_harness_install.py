@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
@@ -31,6 +32,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
 
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
@@ -232,6 +235,31 @@ def test_login_probe_caches_positive_verdicts_with_ttl(
     assert len(runs) == 2
 
 
+def test_invalidate_login_probe_cache_forces_fresh_positive_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual readiness refreshes must not reuse a cached login verdict."""
+    hi.invalidate_harness_login_probe_cache()
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    hi.invalidate_harness_login_probe_cache()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+    hi.invalidate_harness_login_probe_cache()
+
+
 def test_login_probe_never_caches_negative_verdicts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -317,6 +345,52 @@ def test_version_probe_caches_by_binary_signature(
     os.utime(binary, ns=(1, 1))
     assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
     assert len(runs) == 3
+
+
+@pytest.mark.parametrize("returncode", [1, -15])
+@pytest.mark.parametrize("output_stream", ["stdout", "stderr"])
+def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    output_stream: str,
+) -> None:
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    runs = 0
+    repaired = False
+
+    def run_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal runs
+        runs += 1
+        if repaired:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"codex-cli {spec.min_version}\n", stderr=""
+            )
+        diagnostic = "Error: missing optional dependency\nNode.js v22.18.0\n"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=returncode,
+            stdout=diagnostic if output_stream == "stdout" else "",
+            stderr=diagnostic if output_stream == "stderr" else "",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", run_probe)
+
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") == spec
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] is None
+    assert runs == 3
+
+    # Repairing a dependency need not change the launcher's file signature.
+    repaired = True
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") is None
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == spec.min_version
+    assert runs == 4
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -1424,6 +1498,57 @@ def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+@pytest.mark.parametrize("version", ["0.7.0", "0.32.0"])
+def test_the_kimi_floor_accepts_the_floor_and_the_reported_version(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """The declared floor itself, and the build from #4278, must read as installed.
+
+    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` covers the
+    general case at 0.34.0, and the default-floors parametrize covers 0.6.0 /
+    0.34.0. Neither pins the two values that carry the regression:
+
+    * ``0.7.0`` is the floor itself. An off-by-one there — ``>`` where the
+      comparison should be ``>=`` — rejects the exact version this spec
+      declares as supported, and every existing test still passes.
+    * ``0.32.0`` is the version the reporter ran when setup showed
+      "Kimi Code x Needs upgrade". Pinning the reported build is what makes
+      this a regression test for #4278 rather than for the floor in general.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_the_kimi_floor_stays_in_the_kimi_code_version_series() -> None:
+    """The kimi floor must name a ``kimi-code`` release, not a ``kimi-cli`` one.
+
+    ``test_the_kimi_floor_accepts_the_cli_this_spec_installs`` pins one shipping
+    version, so it catches the wrong-project regression only while ``kimi-code``
+    stays below that version. This guards the mistake itself: the two projects
+    share the ``kimi`` name and only their numbering tells them apart —
+    ``kimi-cli`` starts at 1.x, while the ``kimi-code`` binary this spec
+    installs is still a 0.x series. A floor re-derived from ``kimi-cli``'s
+    release list (#4278) is unreachable for every real install, so setup reads
+    "Needs upgrade" no matter how current the user's CLI is.
+
+    When ``kimi-code`` itself ships 1.0, this assertion is the deliberate stop:
+    raise the bound here alongside the floor rather than dropping the guard.
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.min_version is not None
+    assert Version(spec.min_version) < Version("1.0.0")
 
 
 def test_the_hermes_floor_accepts_the_shipping_version_line(
